@@ -30,6 +30,6 @@ rsurl = { version = "0.1", features = ["json"] }
 compcol = { version = "0.6", features = ["std", "xz"] }
 # job.zip = the per-arch cubins.
 zip = { version = "2", default-features = false, features = ["deflate"] }
-# KarpelesLab platform client: blocking REST + signed multipart upload, used by the
-# `submit` producer path to publish jobs via the Decrypt/Data + Decrypt/Job API.
+# KarpelesLab platform client: the worker claims fragments with Decrypt/Job:pullOne
+# and submits results with :submitFragment, and downloads Decrypt/Data blobs.
 klbfw = "0.1"

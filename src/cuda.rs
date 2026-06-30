@@ -78,32 +78,6 @@ fn check(r: CuResult, what: &str) -> Result<(), String> {
     Err(format!("{what}: {msg}"))
 }
 
-/// Probe device 0's `(name, cc_major, cc_minor)` without loading a module — used for
-/// the work-request capability params. `None` if no CUDA device is present.
-pub fn probe_device() -> Option<(String, i32, i32)> {
-    unsafe {
-        if cuInit(0) != 0 {
-            return None;
-        }
-        let mut dev: CuDevice = 0;
-        if cuDeviceGet(&mut dev, 0) != 0 {
-            return None;
-        }
-        let mut buf = [0i8; 128];
-        let name = if cuDeviceGetName(buf.as_mut_ptr() as *mut c_char, 128, dev) == 0 {
-            CStr::from_ptr(buf.as_ptr() as *const c_char)
-                .to_string_lossy()
-                .into_owned()
-        } else {
-            "unknown".into()
-        };
-        let (mut maj, mut min) = (0i32, 0i32);
-        cuDeviceGetAttribute(&mut maj, CU_DEV_ATTR_CC_MAJOR, dev);
-        cuDeviceGetAttribute(&mut min, CU_DEV_ATTR_CC_MINOR, dev);
-        Some((name, maj, min))
-    }
-}
-
 /// A device allocation, freed on drop.
 pub struct DeviceBuf {
     ptr: CuDeviceptr,

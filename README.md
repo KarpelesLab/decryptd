@@ -4,15 +4,20 @@ Generic volunteer GPU job runner for **decrypt**.
 
 `decryptd` knows nothing about bloom filters, RNG, or BIP39 — it is a thin,
 job-agnostic CUDA launcher. All job-specific logic lives in the GPU cubin and an
-opaque data blob produced by the coordinator. A worker just:
+opaque data blob published to the KarpelesLab platform. A worker just:
 
-1. asks the coordinator for a chunk,
-2. downloads the cubin(s) (`job.zip`) and the opaque data blob (`data.xz`),
-3. loads the cubin for the local GPU and launches its kernel over the range,
-4. gathers the output records, compresses them (xz), and uploads them.
+1. claims a fragment of work with `Decrypt/Job:pullOne`,
+2. downloads the job's blobs — `engine.zip` (the per-arch cubins + a
+   `manifest.json`) and an optional `data.xz` — from the inline URLs the pull
+   response carries,
+3. reads the launch parameters from `manifest.json`, loads the cubin for the
+   local GPU, and launches its kernel over the fragment range,
+4. gathers the output records, compresses them (xz), and submits them back with
+   `Decrypt/Job:submitFragment`.
 
-Because the kernel ABI is fixed (see below), the same `decryptd` binary runs any
-job the coordinator hands it.
+`pullOne`/`submitFragment` and the `Decrypt/Data` blobs are anonymous-accessible,
+so a worker needs **no credentials**. Because the kernel ABI is fixed (see
+below), the same `decryptd` binary runs any job the platform hands it.
 
 ## Requirements
 
@@ -38,49 +43,47 @@ Prebuilt `linux-x86_64` and `windows-x86_64` binaries are attached to each
 
 ## Usage
 
-`decryptd` has two subcommands: `run` (the volunteer worker) and `submit` (the
-producer that publishes a job).
-
-### Worker — `decryptd run`
-
-Pulls chunks from a coordinator, runs the kernel, and uploads results, looping
-forever until stopped.
+`decryptd` is a single worker command. Point it at the platform host and it loops
+forever, claiming and running fragments:
 
 ```sh
-decryptd run --server https://sweep.example.com
+decryptd                       # uses the default host www.atonline.com
+decryptd --host www.atonline.com --once
 ```
 
 | Flag | Env | Default | Description |
 | --- | --- | --- | --- |
-| `--server` | `DECRYPTD_SERVER` | — | Coordinator base URL (required). |
-| `--workdir` | `DECRYPTD_WORKDIR` | `decryptd-data` | Worker id, artifact cache, scratch. |
-| `--token` | `DECRYPTD_TOKEN` | — | Optional bearer token for the coordinator. |
-| `--once` | | off | Run a single chunk then exit. |
-| `--idle-secs` | | `15` | Backoff base when the coordinator has no work. |
+| `--host` | `DECRYPTD_HOST` | `www.atonline.com` | KarpelesLab platform host (anonymous — no key needed). |
+| `--workdir` | `DECRYPTD_WORKDIR` | `decryptd-data` | Blob cache and scratch directory. |
+| `--once` | | off | Claim a single fragment then exit. |
+| `--idle-secs` | | `60` | Seconds to wait before retrying when there's no work. |
 
-### Producer — `decryptd submit`
+When `pullOne` reports no open work, the worker waits `--idle-secs` (one minute by
+default) and tries again.
 
-Publishes a job to the KarpelesLab `Decrypt/*` API: uploads `engine.zip` (the
-per-arch cubins) and an optional `data.bin.xz` (the opaque kernel input) as
-`Decrypt\Data` blobs, then creates a `Decrypt\Job` over the half-open range
-`[start, end)` referencing both.
+### Job layout
 
-```sh
-decryptd submit \
-  --engine engine.zip \
-  --data data.bin.xz \
-  --start 0 --end 1000000000
-```
+A job is published to the platform as two `Decrypt/Data` blobs referenced by a
+`Decrypt/Job` over a half-open range `[Range_Start, Range_End)`:
 
-| Flag | Env | Default | Description |
-| --- | --- | --- | --- |
-| `--engine` | | — | Engine archive: per-arch `*.sm<NN>.cubin`, zipped (required). |
-| `--data` | | — | Opaque xz-compressed job data blob (optional). |
-| `--start` | | — | Range start, inclusive (required). |
-| `--end` | | — | Range end, exclusive (required). |
-| `--host` | `DECRYPTD_HOST` | `www.atonline.com` | KarpelesLab API host. |
-| `--api-key` | `DECRYPTD_API_KEY` | — | API key id (job creation needs a trusted caller). |
-| `--api-secret` | `DECRYPTD_API_SECRET` | — | API key secret (base64 Ed25519 secret or 64-byte keypair). |
+- **`engine.zip`** — the per-arch GPU cubins (`*.sm<NN>.cubin`) plus a
+  `manifest.json` carrying the launch parameters:
+
+  ```json
+  {
+    "entry": "decrypt",
+    "record_size": 28,
+    "out_cap": 1048576,
+    "block": 256,
+    "tile": 16777216
+  }
+  ```
+
+  Only `record_size` is required; the rest default as shown.
+- **`data.xz`** *(optional)* — the opaque, xz-compressed kernel input.
+
+The worker tells the two apart by filename (`.zip` vs `.xz`), falling back to the
+file's magic bytes.
 
 ## Kernel ABI
 
@@ -98,8 +101,8 @@ extern "C" __global__ void decrypt(
     unsigned int out_cap);       // capacity in records
 ```
 
-The coordinator chooses the record layout via the assignment's `record_size`;
-the kernel writes `record_size`-byte records into `out` and bumps `out_count`.
+The record layout is chosen by `manifest.json`'s `record_size`; the kernel writes
+`record_size`-byte records into `out` and bumps `out_count`.
 
 ## CI / releases
 

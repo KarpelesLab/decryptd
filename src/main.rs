@@ -1,79 +1,100 @@
 //! `decryptd` — a generic volunteer GPU job runner for decrypt.
 //!
 //! decryptd knows nothing about bloom filters, RNG, or BIP39. It just:
-//!   1. asks the coordinator for a chunk,
-//!   2. downloads the cubin(s) (job.zip) and the opaque data blob (data.xz),
-//!   3. loads the cubin for the local GPU and launches its kernel over the range
+//!   1. claims a fragment of work from the platform (`Decrypt/Job:pullOne`),
+//!   2. downloads the job's blobs (`engine.zip` + an optional `data.xz`) from the
+//!      inline URLs the pull response carries,
+//!   3. reads launch parameters from `manifest.json` inside `engine.zip`, loads the
+//!      cubin for the local GPU, and launches its kernel over the fragment range
 //!      (the kernel does all the real work and writes output records),
-//!   4. gathers the output records, compresses them (xz), and uploads.
+//!   4. gathers the output records, compresses them (xz), and submits them back with
+//!      `Decrypt/Job:submitFragment`.
 //!
-//! All job-specific logic lives in the cubin + the data blob, produced by the
-//! coordinator. See docs/cluster-protocol.md and the kernel ABI in `cuda.rs`.
+//! `pullOne`/`submitFragment` and the `Decrypt/Data` blobs are anonymous-accessible,
+//! so a worker needs no credentials. All job-specific logic lives in the cubin + the
+//! data blob, produced by the job's publisher. See the kernel ABI in `cuda.rs`.
 
 mod cuda;
-mod submit;
 
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::io::{Cursor, Read};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, Subcommand};
+use clap::Parser;
+use klbfw::{Config, RestContext};
 use serde::Deserialize;
+use serde_json::{Value, json};
 
+/// Run as a worker: claim Decrypt/Job fragments, run the kernel, submit results.
 #[derive(Parser)]
 #[command(name = "decryptd", about = "Generic GPU job runner for decrypt")]
-struct Cli {
-    #[command(subcommand)]
-    cmd: Cmd,
-}
-
-#[derive(Subcommand)]
-enum Cmd {
-    /// Run as a worker: pull GPU chunks, run the kernel, upload results.
-    Run(RunArgs),
-    /// Publish a job to the KLB Decrypt/* API: upload engine.zip + data.bin.xz as
-    /// Decrypt\Data blobs and create a Decrypt\Job over a range referencing both.
-    Submit(submit::SubmitArgs),
-}
-
-#[derive(Parser)]
 struct RunArgs {
-    /// Coordinator base URL, e.g. <https://sweep.example.com>
-    #[arg(long, env = "DECRYPTD_SERVER")]
-    server: String,
-    /// Working directory for the worker id, artifact cache, and scratch.
+    /// KarpelesLab platform host (pullOne/submitFragment are anonymous — no key needed).
+    #[arg(long, env = "DECRYPTD_HOST", default_value = "www.atonline.com")]
+    host: String,
+    /// Working directory for the blob cache and scratch.
     #[arg(long, env = "DECRYPTD_WORKDIR", default_value = "decryptd-data")]
     workdir: PathBuf,
-    /// Optional bearer token for the coordinator.
-    #[arg(long, env = "DECRYPTD_TOKEN")]
-    token: Option<String>,
-    /// Run a single chunk then exit (default: loop forever).
+    /// Claim a single fragment then exit (default: loop forever).
     #[arg(long)]
     once: bool,
-    /// Seconds to wait when the coordinator has no work (capped backoff base).
-    #[arg(long, default_value_t = 15)]
+    /// Seconds to wait before retrying when no work is available.
+    #[arg(long, default_value_t = 60)]
     idle_secs: u64,
 }
 
-// ----------------------------------------------------------------- assignment JSON
+// ------------------------------------------------------------- pullOne response
+/// `Decrypt/Job:pullOne` payload — a claimed fragment plus its parent job's blobs.
 #[derive(Deserialize)]
-struct Assignment {
-    assignment_id: String,
-    #[allow(dead_code)]
-    #[serde(default)]
-    job_id: String,
-    range: RangeSpec,
-    launch: Launch,
-    artifacts: Artifacts,
+struct Pull {
+    #[serde(rename = "Fragment")]
+    fragment: Fragment,
+    #[serde(rename = "Job")]
+    job: Job,
 }
 #[derive(Deserialize)]
-struct RangeSpec {
-    start: u64,
-    end: u64,
+struct Fragment {
+    #[serde(rename = "Range_Start", deserialize_with = "de_u64")]
+    range_start: u64,
+    /// Exclusive — the platform's ranges are half-open `[Range_Start, Range_End)`.
+    #[serde(rename = "Range_End", deserialize_with = "de_u64")]
+    range_end: u64,
+    /// Single-use handle that authenticates this fragment's result submission.
+    #[serde(rename = "Response_Key")]
+    response_key: String,
 }
-/// Generic kernel launch parameters (no job semantics — just how to run the cubin).
 #[derive(Deserialize)]
-struct Launch {
+struct Job {
+    #[serde(rename = "Data", default)]
+    data: Vec<DataRef>,
+}
+#[derive(Deserialize)]
+struct DataRef {
+    /// Inline download URL (populated by pullOne).
+    #[serde(rename = "Url")]
+    url: Option<String>,
+    /// Upload key — the blob's content SHA-256, used to verify + cache the download.
+    #[serde(rename = "Key", default)]
+    key: String,
+}
+
+/// BIGINT columns serialize as JSON strings; accept a number too, just in case.
+fn de_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    use serde::de::Error;
+    match Value::deserialize(d)? {
+        Value::String(s) => s.parse().map_err(Error::custom),
+        Value::Number(n) => n.as_u64().ok_or_else(|| Error::custom("not a u64")),
+        other => Err(Error::custom(format!("expected u64, got {other}"))),
+    }
+}
+
+// ----------------------------------------------------------------- engine.zip
+/// `manifest.json` shipped inside `engine.zip` — the generic kernel launch
+/// parameters that the platform's Decrypt/Job row does not carry.
+#[derive(Deserialize)]
+struct Manifest {
     /// Kernel entry-point symbol name.
     #[serde(default = "d_entry")]
     entry: String,
@@ -102,195 +123,156 @@ fn d_tile() -> u64 {
     1 << 24
 }
 
-#[derive(Deserialize)]
-struct Artifacts {
-    job: Blob,
-    #[serde(default)]
-    data: Option<Blob>,
-}
-#[derive(Deserialize)]
-struct Blob {
-    url: String,
-    sha256: String,
-}
-
-// --------------------------------------------------------------------------- http
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
+// --------------------------------------------------------------------- helpers
 fn sha256_hex(bytes: &[u8]) -> String {
-    hex(purecrypto::hash::sha256(bytes).as_ref())
-}
-
-fn os_tag() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "windows-x64"
-    } else if cfg!(target_os = "macos") {
-        "macos-arm64"
-    } else {
-        "linux-x64"
-    }
-}
-
-fn urlencode(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
-            _ => format!("%{b:02X}"),
-        })
+    purecrypto::hash::sha256(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
         .collect()
 }
 
-fn req(method: &str, url: &str, token: &Option<String>) -> Result<rsurl::Request> {
-    let mut r = rsurl::Request::new(method, url).map_err(|e| anyhow!("{e}"))?;
-    if let Some(t) = token {
-        r = r.header("authorization", &format!("Bearer {t}"));
-    }
-    Ok(r.max_time(Duration::from_secs(300)))
+/// The last path segment of a URL, ignoring any query/fragment.
+fn url_filename(url: &str) -> &str {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.rsplit('/').next().unwrap_or(path)
 }
 
-/// Ask for a chunk. `Ok(None)` on HTTP 204 (no work).
-fn request_work(args: &RunArgs, worker: &str) -> Result<Option<Assignment>> {
-    let (gpu, maj, min) = cuda::probe_device().unwrap_or(("none".into(), 0, 0));
-    let url = format!(
-        "{}/v1/work?worker={worker}&os={}&cc={maj}{min}&ver={}&gpu={}",
-        args.server.trim_end_matches('/'),
-        os_tag(),
-        env!("CARGO_PKG_VERSION"),
-        urlencode(&gpu),
-    );
-    let resp = req("GET", &url, &args.token)?
-        .send()
-        .map_err(|e| anyhow!("GET /v1/work: {e}"))?;
-    if resp.status == 204 {
-        return Ok(None);
-    }
-    if resp.status >= 400 {
-        bail!("GET /v1/work → HTTP {}", resp.status);
-    }
-    Ok(Some(
-        serde_json::from_slice(&resp.body).context("parsing assignment JSON")?,
-    ))
+fn is_zip(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06")
 }
 
-/// Download (or reuse from cache) an artifact, verifying its SHA-256.
-fn fetch_blob(args: &RunArgs, blob: &Blob, cache: &Path) -> Result<Vec<u8>> {
-    std::fs::create_dir_all(cache)?;
-    let path = cache.join(&blob.sha256);
-    if let Ok(bytes) = std::fs::read(&path)
-        && sha256_hex(&bytes) == blob.sha256
+/// Download a Job.Data blob from its inline URL, caching it under its content hash.
+fn fetch_blob(args: &RunArgs, d: &DataRef) -> Result<Vec<u8>> {
+    let url = d
+        .url
+        .as_deref()
+        .ok_or_else(|| anyhow!("Job.Data entry has no Url"))?;
+    let cache = args.workdir.join("cache");
+    std::fs::create_dir_all(&cache)?;
+    // `Key` is the upload-time content SHA-256, so it doubles as a cache key + checksum.
+    let cache_path = (!d.key.is_empty()).then(|| cache.join(&d.key));
+    if let Some(p) = &cache_path
+        && let Ok(bytes) = std::fs::read(p)
+        && sha256_hex(&bytes) == d.key
     {
         return Ok(bytes); // cache hit
     }
-    let url = if blob.url.starts_with("http") {
-        blob.url.clone()
-    } else {
-        format!("{}{}", args.server.trim_end_matches('/'), blob.url)
-    };
-    eprintln!(
-        "[decryptd] downloading {} ({})",
-        blob.url,
-        &blob.sha256[..12.min(blob.sha256.len())]
-    );
-    let resp = req("GET", &url, &args.token)?
+    eprintln!("[decryptd] downloading {}", url_filename(url));
+    let resp = rsurl::Request::new("GET", url)
+        .map_err(|e| anyhow!("{e}"))?
+        .max_time(Duration::from_secs(300))
         .send()
         .map_err(|e| anyhow!("GET {url}: {e}"))?;
     if resp.status >= 400 {
         bail!("GET {url} → HTTP {}", resp.status);
     }
-    let got = sha256_hex(&resp.body);
-    if got != blob.sha256 {
-        bail!("sha256 mismatch for {url}: got {got}, want {}", blob.sha256);
+    if !d.key.is_empty() {
+        let got = sha256_hex(&resp.body);
+        if got != d.key {
+            bail!("sha256 mismatch for {url}: got {got}, want {}", d.key);
+        }
     }
-    std::fs::write(&path, &resp.body)?;
+    if let Some(p) = &cache_path {
+        std::fs::write(p, &resp.body)?;
+    }
     Ok(resp.body)
 }
 
-/// Extract job.zip and return every `*.sm<NN>.cubin`'s bytes, highest-arch first.
-fn ensure_cubins(args: &RunArgs, blob: &Blob) -> Result<Vec<Vec<u8>>> {
-    let zip_bytes = fetch_blob(args, blob, &args.workdir.join("cache"))?;
-    let dest = args.workdir.join("jobs").join(&blob.sha256);
-    if !dest.join(".unpacked").exists() {
-        std::fs::create_dir_all(&dest)?;
-        let mut zip =
-            zip::ZipArchive::new(std::io::Cursor::new(&zip_bytes)).context("opening job.zip")?;
-        zip.extract(&dest).context("extracting job.zip")?;
-        std::fs::write(dest.join(".unpacked"), b"")?;
-    }
-    // Collect cubins by arch parsed from `.sm<NN>.cubin`, then sort high→low.
-    let mut found: Vec<(u32, PathBuf)> = Vec::new();
-    for e in std::fs::read_dir(&dest)?.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if let Some(i) = name.find(".sm")
+/// Unpack engine.zip: parse `manifest.json` and collect every `*.sm<NN>.cubin`'s
+/// bytes, highest compute-capability first.
+fn unpack_engine(zip_bytes: &[u8]) -> Result<(Manifest, Vec<Vec<u8>>)> {
+    let mut zip = zip::ZipArchive::new(Cursor::new(zip_bytes)).context("opening engine.zip")?;
+    let mut manifest: Option<Manifest> = None;
+    let mut cubins: Vec<(u32, Vec<u8>)> = Vec::new();
+    for i in 0..zip.len() {
+        let mut f = zip.by_index(i)?;
+        let name = f.name().rsplit('/').next().unwrap_or(f.name()).to_string();
+        if name == "manifest.json" {
+            let mut s = String::new();
+            f.read_to_string(&mut s)?;
+            manifest = Some(serde_json::from_str(&s).context("parsing manifest.json")?);
+        } else if let Some(i) = name.find(".sm")
             && let Some(rest) = name[i + 3..].strip_suffix(".cubin")
             && let Ok(arch) = rest.parse::<u32>()
         {
-            found.push((arch, e.path()));
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf)?;
+            cubins.push((arch, buf));
         }
     }
-    if found.is_empty() {
-        bail!("job.zip contains no *.sm<NN>.cubin files");
+    let manifest = manifest.ok_or_else(|| anyhow!("engine.zip has no manifest.json"))?;
+    if cubins.is_empty() {
+        bail!("engine.zip contains no *.sm<NN>.cubin files");
     }
-    found.sort_by_key(|b| std::cmp::Reverse(b.0));
-    Ok(found
-        .iter()
-        .filter_map(|(_, p)| std::fs::read(p).ok())
-        .collect())
-}
-
-/// Download + xz-decompress the opaque data blob (cached per content hash).
-fn ensure_data(args: &RunArgs, blob: &Blob) -> Result<Vec<u8>> {
-    let raw = args
-        .workdir
-        .join("data")
-        .join(format!("{}.bin", blob.sha256));
-    if let Ok(bytes) = std::fs::read(&raw) {
-        return Ok(bytes);
-    }
-    let xz = fetch_blob(args, blob, &args.workdir.join("cache"))?;
-    let data = compcol::vec::decompress_to_vec::<compcol::xz::Xz>(&xz)
-        .map_err(|e| anyhow!("xz-decompressing data: {e:?}"))?;
-    std::fs::create_dir_all(raw.parent().unwrap())?;
-    std::fs::write(&raw, &data)?;
-    Ok(data)
+    cubins.sort_by_key(|c| std::cmp::Reverse(c.0));
+    Ok((manifest, cubins.into_iter().map(|(_, b)| b).collect()))
 }
 
 // --------------------------------------------------------------------------- run
-fn run_once(args: &RunArgs, worker: &str) -> Result<bool> {
-    let Some(a) = request_work(args, worker)? else {
+/// Claim and process one fragment. `Ok(false)` means the platform had no open work.
+fn run_once(args: &RunArgs, ctx: &RestContext) -> Result<bool> {
+    let resp = ctx
+        .do_request("Decrypt/Job:pullOne", "POST", json!({}))
+        .map_err(|e| anyhow!("Decrypt/Job:pullOne: {e}"))?;
+    // pullOne returns null data when there are no open jobs with fragments to issue.
+    let Some(data) = resp.raw().filter(|v| !v.is_null()) else {
         return Ok(false);
     };
-    let cubins = ensure_cubins(args, &a.artifacts.job)?;
-    let data = match &a.artifacts.data {
-        Some(b) => ensure_data(args, b)?,
+    let pull: Pull = serde_json::from_value(data.clone()).context("parsing pullOne response")?;
+
+    // Download the job's blobs and tell engine.zip from data.xz by filename (with a
+    // magic-byte fallback when the URL carries no usable name).
+    let mut engine_zip: Option<Vec<u8>> = None;
+    let mut data_xz: Option<Vec<u8>> = None;
+    for d in &pull.job.data {
+        let bytes = fetch_blob(args, d)?;
+        let name = d.url.as_deref().map(url_filename).unwrap_or("");
+        let is_engine = if name.ends_with(".zip") {
+            true
+        } else if name.ends_with(".xz") {
+            false
+        } else {
+            is_zip(&bytes)
+        };
+        if is_engine {
+            engine_zip = Some(bytes);
+        } else {
+            data_xz = Some(bytes);
+        }
+    }
+    let engine_zip = engine_zip.ok_or_else(|| anyhow!("job has no engine .zip blob"))?;
+    let (manifest, cubins) = unpack_engine(&engine_zip)?;
+    let data = match data_xz {
+        Some(xz) => compcol::vec::decompress_to_vec::<compcol::xz::Xz>(&xz)
+            .map_err(|e| anyhow!("xz-decompressing data: {e:?}"))?,
         None => Vec::new(),
     };
 
+    let (start, end) = (pull.fragment.range_start, pull.fragment.range_end);
+    if end <= start {
+        bail!("empty fragment range [{start}, {end})");
+    }
+    let total = end - start;
+
     let gpu = cuda::Gpu::load_first(&cubins).map_err(|e| anyhow!(e))?;
     let (maj, min) = gpu.compute_capability();
-    let total = a.range.end.saturating_sub(a.range.start).saturating_add(1);
     eprintln!(
-        "[decryptd] chunk {} on {} (sm_{maj}{min}): entry={} range {}..={} ({total} items)",
-        a.assignment_id,
+        "[decryptd] fragment [{start}, {end}) on {} (sm_{maj}{min}): entry={} ({total} items)",
         gpu.device_name(),
-        a.launch.entry,
-        a.range.start,
-        a.range.end
+        manifest.entry,
     );
 
     let t0 = Instant::now();
     let out = cuda::run_job(
         &gpu,
-        &a.launch.entry,
+        &manifest.entry,
         &data,
-        a.range.start,
-        a.range.end,
-        a.launch.record_size,
-        a.launch.out_cap,
-        a.launch.block,
-        a.launch.tile,
+        start,
+        end - 1, // run_job's range is inclusive
+        manifest.record_size,
+        manifest.out_cap,
+        manifest.block,
+        manifest.tile,
         |done, total| {
             eprint!(
                 "\r  {done}/{total} ({:.1}%)   ",
@@ -300,107 +282,71 @@ fn run_once(args: &RunArgs, worker: &str) -> Result<bool> {
     )
     .map_err(|e| anyhow!("run_job: {e}"))?;
     eprintln!();
-    let records = out.len() / a.launch.record_size.max(1) as usize;
+    let records = out.len() / manifest.record_size.max(1) as usize;
 
-    // Compress the raw output records and upload.
+    // Compress the raw output records and submit them back to the fragment.
     let packed = compcol::vec::compress_to_vec::<compcol::xz::Xz>(&out)
         .map_err(|e| anyhow!("xz-compressing result: {e:?}"))?;
-    upload_result(
-        args,
-        &a,
+    submit_result(
+        ctx,
+        &pull.fragment.response_key,
         &packed,
-        worker,
         records as u64,
         t0.elapsed().as_secs_f64(),
     )?;
     Ok(true)
 }
 
-fn upload_result(
-    args: &RunArgs,
-    a: &Assignment,
+/// Submit the fragment's xz-compressed result via `Decrypt/Job:submitFragment`.
+fn submit_result(
+    ctx: &RestContext,
+    response_key: &str,
     body: &[u8],
-    worker: &str,
     records: u64,
     secs: f64,
 ) -> Result<()> {
-    let url = format!(
-        "{}/v1/work/{}/result",
-        args.server.trim_end_matches('/'),
-        a.assignment_id
+    let mut params: HashMap<String, Value> = HashMap::new();
+    params.insert(
+        "responseKey".to_string(),
+        Value::String(response_key.to_string()),
     );
-    let resp = req("POST", &url, &args.token)?
-        .header("content-type", "application/x-xz")
-        .header("x-decryptd-records", &records.to_string())
-        .header("x-decryptd-record-size", &a.launch.record_size.to_string())
-        .header("x-decryptd-seconds", &format!("{secs:.1}"))
-        .header("x-decryptd-worker", worker)
-        .body(body.to_vec())
-        .send()
-        .map_err(|e| anyhow!("POST result: {e}"))?;
-    if resp.status >= 400 {
-        bail!("POST result → HTTP {} {}", resp.status, resp.reason);
-    }
+    // submitFragment goes through the platform's standard upload (prepareCbCtx) flow.
+    klbfw::upload(
+        ctx,
+        "Decrypt/Job:submitFragment",
+        "POST",
+        params,
+        Cursor::new(body.to_vec()),
+        "application/x-xz",
+        None,
+    )
+    .map_err(|e| anyhow!("Decrypt/Job:submitFragment: {e}"))?;
     eprintln!(
-        "[decryptd] uploaded {records} record(s) ({} B xz) for {} in {secs:.1}s",
-        body.len(),
-        a.assignment_id
+        "[decryptd] submitted {records} record(s) ({} B xz) in {secs:.1}s",
+        body.len()
     );
     Ok(())
 }
 
-/// Stable per-install worker id, persisted in the work dir.
-fn worker_id(workdir: &Path) -> Result<String> {
-    let path = workdir.join("worker-id");
-    if let Ok(s) = std::fs::read_to_string(&path) {
-        let s = s.trim().to_string();
-        if !s.is_empty() {
-            return Ok(s);
-        }
-    }
-    let host = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_default();
-    let seed = format!(
-        "{host}|{}|{:?}",
-        std::process::id(),
-        std::env::current_exe().ok()
-    );
-    let id = format!("w-{}", &sha256_hex(seed.as_bytes())[..16]);
-    std::fs::create_dir_all(workdir)?;
-    std::fs::write(&path, &id)?;
-    Ok(id)
-}
-
 fn main() -> Result<()> {
-    match Cli::parse().cmd {
-        Cmd::Run(args) => run_worker(args),
-        Cmd::Submit(args) => submit::run(args),
-    }
+    run_worker(RunArgs::parse())
 }
 
 fn run_worker(args: RunArgs) -> Result<()> {
     std::fs::create_dir_all(&args.workdir)?;
-    let worker = worker_id(&args.workdir)?;
-    eprintln!(
-        "[decryptd] id={worker} os={} server={}",
-        os_tag(),
-        args.server
-    );
+    let ctx = RestContext::with_config(Config::new("https".to_string(), args.host.clone()));
+    eprintln!("[decryptd] host={}", args.host);
 
-    let mut idle = 0u32;
     loop {
-        match run_once(&args, &worker) {
-            Ok(true) => idle = 0,
+        match run_once(&args, &ctx) {
+            Ok(true) => {}
             Ok(false) => {
                 if args.once {
                     eprintln!("[decryptd] no work; exiting (--once)");
                     return Ok(());
                 }
-                let wait = args.idle_secs * (1 << idle.min(4));
-                eprintln!("[decryptd] no work; sleeping {wait}s");
-                std::thread::sleep(Duration::from_secs(wait));
-                idle = idle.saturating_add(1);
+                eprintln!("[decryptd] no work; sleeping {}s", args.idle_secs);
+                std::thread::sleep(Duration::from_secs(args.idle_secs));
             }
             Err(e) => {
                 eprintln!("[decryptd] error: {e:#}");
