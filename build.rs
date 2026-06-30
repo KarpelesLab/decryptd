@@ -9,17 +9,57 @@ fn main() {
     embed_windows_icon();
 }
 
-/// Embed the application icon into `decryptd.exe` so it shows up in Explorer, the
-/// taskbar, and the tray. Compiled only when the build host is Windows (where
-/// `winresource` and rc.exe exist); a no-op everywhere else, including when
-/// cross-compiling a Windows target from Linux.
+/// Embed the application icon and version-info resource into `decryptd.exe` so it
+/// shows up in Explorer, the taskbar, the tray, and the file Properties dialog.
+/// Compiled only when the build host is Windows (where `winresource` and rc.exe
+/// exist); a no-op everywhere else, including when cross-compiling a Windows
+/// target from Linux.
 #[cfg(windows)]
 fn embed_windows_icon() {
     println!("cargo:rerun-if-changed=assets/decryptd.ico");
+    // The VERSIONINFO fields derive from Cargo metadata. A build script that emits
+    // any `rerun-if-*` directive (link_cuda does) otherwise stops rerunning on
+    // Cargo.toml edits, which would leave a stale version baked into the exe — so
+    // re-run whenever any of these change.
+    let env = |k: &str| std::env::var(k).unwrap_or_default();
+    for k in [
+        "CARGO_PKG_VERSION",
+        "CARGO_PKG_NAME",
+        "CARGO_PKG_AUTHORS",
+        "CARGO_PKG_DESCRIPTION",
+        "CARGO_PKG_REPOSITORY",
+    ] {
+        println!("cargo:rerun-if-env-changed={k}");
+    }
+
+    let name = env("CARGO_PKG_NAME");
+    let description = env("CARGO_PKG_DESCRIPTION");
+    let repository = env("CARGO_PKG_REPOSITORY");
+    // CARGO_PKG_AUTHORS is colon-separated for multiple authors.
+    let authors = env("CARGO_PKG_AUTHORS").replace(':', ", ");
+
     let mut res = winresource::WindowsResource::new();
     res.set_icon("assets/decryptd.ico");
+    // winresource already fills FileVersion / ProductVersion / ProductName and a
+    // FileDescription (defaulted to the crate name); add the rest of the standard
+    // VERSIONINFO strings.
+    if !description.is_empty() {
+        res.set("FileDescription", &description);
+    }
+    if !authors.is_empty() {
+        res.set("CompanyName", &authors);
+        res.set("LegalCopyright", &format!("Copyright © {authors}"));
+    }
+    if !name.is_empty() {
+        res.set("InternalName", &name);
+        res.set("OriginalFilename", &format!("{name}.exe"));
+    }
+    if !repository.is_empty() {
+        res.set("Comments", &repository);
+    }
+
     if let Err(e) = res.compile() {
-        println!("cargo:warning=failed to embed Windows icon: {e}");
+        println!("cargo:warning=failed to embed Windows resources: {e}");
     }
 }
 
