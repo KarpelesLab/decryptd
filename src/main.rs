@@ -600,9 +600,43 @@ fn upload_loop(ctx: RestContext, inflight: InFlight, done: Arc<Mutex<Receiver<Fi
     }
 }
 
+/// Trust anchor for self-updates: the 32-byte fingerprint of the decryptd
+/// release signing key (exported with `rsupd id export`). The updater refuses
+/// any release manifest not signed by the matching private identity.
+const RSUPD_FINGERPRINT: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/decryptd.fpr"));
+
+/// Build the signed auto-updater. Its `HttpTransport` fetches the latest signed
+/// manifest and the artifact for this build's target over rsurl from rsupd's
+/// default distribution host.
+fn build_updater() -> rsupd::Result<rsupd::Updater> {
+    rsupd::Updater::builder(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+        .fingerprint(RSUPD_FINGERPRINT)
+        .channel("stable")
+        .transport(Box::new(rsupd::HttpTransport::with_default_base(
+            RSUPD_FINGERPRINT,
+        )))
+        .build()
+}
+
 fn main() -> Result<()> {
+    // If we were just re-exec'd by a self-update, settle briefly before running.
+    rsupd::honor_startup_delay();
+
     let args = RunArgs::parse();
     let status = Status::default();
+
+    // Long-lived workers keep themselves current: check hourly in the background
+    // and restart into each new signed build. `--once` is short-lived, so it
+    // skips the updater.
+    if !args.once {
+        match build_updater() {
+            Ok(updater) => {
+                updater.spawn_auto_update(false);
+            }
+            Err(e) => eprintln!("[decryptd] auto-update disabled: {e}"),
+        }
+    }
 
     // GUI build (Windows/Linux): unless `--once`, hand the main thread to the
     // system-tray event loop and run the worker pipeline behind it.
