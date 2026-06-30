@@ -14,24 +14,21 @@ repeats — forever, until you stop it. Run and forget.
 
 ## Get it
 
-Download the latest binary from the [Releases](../../releases) page:
+Download the latest archive from the [Releases](../../releases) page and unpack
+it:
 
-- **Linux:** `decryptd-linux-x86_64`
-- **Windows:** `decryptd-windows-x86_64.exe`
+- **Linux:** `decryptd-linux-x86_64.tar.gz` → `tar -xzf decryptd-linux-x86_64.tar.gz`
+- **Windows:** `decryptd-windows-x86_64.zip` → extract it (right-click → Extract All)
 
-On Linux, make it executable:
-
-```sh
-chmod +x decryptd-linux-x86_64
-```
+Each archive contains a single `decryptd` executable.
 
 ## Run it
 
 Just run it — no configuration needed:
 
 ```sh
-./decryptd-linux-x86_64        # Linux
-decryptd-windows-x86_64.exe    # Windows
+./decryptd        # Linux
+decryptd.exe      # Windows
 ```
 
 It loops forever: claiming work, running it on the GPU, submitting results. When
@@ -44,7 +41,7 @@ To keep it going after you log out:
 
 ```sh
 # Linux — quick and dirty
-nohup ./decryptd-linux-x86_64 >decryptd.log 2>&1 &
+nohup ./decryptd >decryptd.log 2>&1 &
 ```
 
 For an always-on contributor, run it under a service manager (systemd on Linux,

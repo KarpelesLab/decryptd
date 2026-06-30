@@ -24,12 +24,12 @@ jobs:
         include:
           - name: linux-x86_64
             os: ubuntu-latest
-            artifact: decryptd-linux-x86_64
             bin: decryptd
+            archive: decryptd-linux-x86_64.tar.gz
           - name: windows-x86_64
             os: windows-latest
-            artifact: decryptd-windows-x86_64.exe
             bin: decryptd.exe
+            archive: decryptd-windows-x86_64.zip
     steps:
       - uses: actions/checkout@v4
 
@@ -50,14 +50,21 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
-      - name: Stage binary
-        shell: bash
+      - name: Package (Linux → tar.gz)
+        if: runner.os == 'Linux'
         run: |
           mkdir -p dist
-          cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
+          tar -czf "dist/${{ matrix.archive }}" -C target/release "${{ matrix.bin }}"
+
+      - name: Package (Windows → zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "target/release/${{ matrix.bin }}" -DestinationPath "dist/${{ matrix.archive }}"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}
+          name: ${{ matrix.archive }}
+          path: dist/${{ matrix.archive }}
           if-no-files-found: error
