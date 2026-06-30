@@ -3,10 +3,50 @@
 //! Windows, embeds the application icon into the executable.
 
 use std::path::Path;
+use std::process::Command;
 
 fn main() {
     link_cuda();
     embed_windows_icon();
+    stamp_build_identity();
+}
+
+/// Capture this build's git identity (short hash + commit time) as compile-time
+/// env vars for the rsupd updater's "is this a newer build of the same version?"
+/// check (see `build_updater` in `main.rs`). Empty when built outside a git
+/// checkout (e.g. a crates.io tarball); the updater then falls back to a plain
+/// semver comparison.
+fn stamp_build_identity() {
+    fn git(args: &[&str]) -> Option<String> {
+        let out = Command::new("git").args(args).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+        (!s.is_empty()).then_some(s)
+    }
+
+    let git_tag = git(&["rev-parse", "--short=7", "HEAD"]).unwrap_or_default();
+    let build_unix = git(&["log", "-1", "--format=%ct", "HEAD"]).unwrap_or_default();
+    println!("cargo:rustc-env=RSUPD_GIT_TAG={git_tag}");
+    println!("cargo:rustc-env=RSUPD_BUILD_UNIX={build_unix}");
+
+    // Re-stamp when the checked-out commit moves.
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    if let Ok(head) = std::fs::read_to_string(".git/HEAD")
+        && let Some(reference) = head.strip_prefix("ref:")
+    {
+        // Only the first line, and only a clean ref path — an embedded newline
+        // could otherwise inject extra `cargo:` directives.
+        let reference = reference.lines().next().unwrap_or("").trim();
+        if !reference.is_empty()
+            && !reference
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control())
+        {
+            println!("cargo:rerun-if-changed=.git/{reference}");
+        }
+    }
 }
 
 /// Embed the application icon and version-info resource into `decryptd.exe` so it

@@ -607,10 +607,14 @@ fn upload_loop(ctx: RestContext, inflight: InFlight, done: Arc<Mutex<Receiver<Fi
 const RSUPD_FINGERPRINT: &str = "80b9edc7e6eaebf10b2a25bb10556b9b7fa6abc9fbe556706a2b680cefa4a0fc";
 
 /// Build the signed auto-updater. The transport (dist-go over rsurl) and channel
-/// (`master`) default from the fingerprint, so the anchor is the only input.
+/// (`master`) default from the fingerprint, so the anchor is the only required
+/// input. The git stamps from `build.rs` let it also spot a newer build of the
+/// same version (and never reinstall the identical build).
 fn build_updater() -> rsupd::Result<rsupd::Updater> {
     rsupd::Updater::builder(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
         .fingerprint_hex(RSUPD_FINGERPRINT)
+        .git_tag(env!("RSUPD_GIT_TAG"))
+        .date_tag(rsupd::date_tag_from_unix(env!("RSUPD_BUILD_UNIX")))
         .build()
 }
 
