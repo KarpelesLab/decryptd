@@ -26,8 +26,9 @@ purecrypto = { version = "0.6.7", features = ["hazmat-secp256k1"] }
 # Pinned to the same major as klbfw's rsurl (0.1) — two rsurl versions in one binary
 # collide on its C FFI symbols (duplicate-symbol link error).
 rsurl = { version = "0.1", features = ["json"] }
-# In-house compression collection: xz for the data blob (in) + the result (out).
-compcol = { version = "0.6", features = ["std", "xz"] }
+# In-house compression collection: xz for the result (out); the data blob (in)
+# is auto-detected, so pull in the common container formats too.
+compcol = { version = "0.6", features = ["std", "xz", "gzip", "bzip2", "zstd"] }
 # job.zip = the per-arch cubins.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # KarpelesLab platform client: the worker claims fragments with Decrypt/Job:pullOne

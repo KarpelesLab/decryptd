@@ -2,8 +2,9 @@
 //!
 //! decryptd knows nothing about bloom filters, RNG, or BIP39. It just:
 //!   1. claims a fragment of work from the platform (`Decrypt/Job:pullOne`),
-//!   2. downloads the job's blobs (`engine.zip` + an optional `data.xz`) from the
-//!      inline URLs the pull response carries,
+//!   2. downloads the job's blobs (`engine.zip` + an optional compressed `data`
+//!      blob — xz/gzip/bzip2/zstd, auto-detected) from the inline URLs the pull
+//!      response carries,
 //!   3. reads launch parameters from `manifest.json` inside `engine.zip`, loads the
 //!      cubin for the local GPU, and launches its kernel over the fragment range
 //!      (the kernel does all the real work and writes output records),
@@ -90,7 +91,7 @@ struct DataRef {
     /// Inline signed download URL.
     #[serde(rename = "Url")]
     url: Option<String>,
-    /// Original filename — `engine.zip` vs `data.*.xz` tells the two blobs apart.
+    /// Original filename — `engine.zip` vs the `data` blob tells the two apart.
     #[serde(rename = "Filename", default)]
     filename: String,
     /// Content SHA-256, used to verify + cache the download.
@@ -282,20 +283,19 @@ fn claim_and_fetch(
     // The fragment is now ours; release it from the in-flight set if download fails.
     let fetched = (|| -> Result<ReadyJob> {
         let mut engine_zip: Option<Vec<u8>> = None;
-        let mut data_xz: Option<Vec<u8>> = None;
+        let mut data_blob: Option<Vec<u8>> = None;
         for d in &pull.job.data {
             let bytes = fetch_blob(args, d)?;
             if d.filename.ends_with(".zip") {
                 engine_zip = Some(bytes);
             } else {
-                data_xz = Some(bytes);
+                data_blob = Some(bytes);
             }
         }
         let engine_zip = engine_zip.ok_or_else(|| anyhow!("job has no engine .zip blob"))?;
         let (manifest, cubins) = unpack_engine(&engine_zip)?;
-        let data = match data_xz {
-            Some(xz) => compcol::vec::decompress_to_vec::<compcol::xz::Xz>(&xz)
-                .map_err(|e| anyhow!("xz-decompressing data: {e:?}"))?,
+        let data = match data_blob {
+            Some(blob) => decompress_data(&blob)?,
             None => Vec::new(),
         };
         Ok(ReadyJob {
@@ -320,6 +320,30 @@ fn claim_and_fetch(
             inflight.lock().unwrap().remove(&frag_id);
             Err(e)
         }
+    }
+}
+
+/// Decompress a data blob, auto-detecting the container format from its magic
+/// bytes. The publisher historically shipped `data.xz`, but any of the common
+/// stream formats below works just as well, so we sniff rather than assume.
+/// An uncompressed blob (no recognized magic) is passed through verbatim.
+fn decompress_data(blob: &[u8]) -> Result<Vec<u8>> {
+    let starts = |magic: &[u8]| blob.starts_with(magic);
+    if starts(&[0xFD, b'7', b'z', b'X', b'Z', 0x00]) {
+        compcol::vec::decompress_to_vec::<compcol::xz::Xz>(blob)
+            .map_err(|e| anyhow!("xz-decompressing data: {e:?}"))
+    } else if starts(&[0x1F, 0x8B]) {
+        compcol::vec::decompress_to_vec::<compcol::gzip::Gzip>(blob)
+            .map_err(|e| anyhow!("gzip-decompressing data: {e:?}"))
+    } else if starts(b"BZh") {
+        compcol::vec::decompress_to_vec::<compcol::bzip2::Bzip2>(blob)
+            .map_err(|e| anyhow!("bzip2-decompressing data: {e:?}"))
+    } else if starts(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        compcol::vec::decompress_to_vec::<compcol::zstd::Zstd>(blob)
+            .map_err(|e| anyhow!("zstd-decompressing data: {e:?}"))
+    } else {
+        // No recognized magic — assume the blob is already plaintext.
+        Ok(blob.to_vec())
     }
 }
 
