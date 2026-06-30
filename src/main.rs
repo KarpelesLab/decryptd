@@ -134,25 +134,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// The last path segment of a URL, ignoring any query/fragment.
-fn url_filename(url: &str) -> &str {
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    path.rsplit('/').next().unwrap_or(path)
-}
-
-/// A blob's filename: the explicit `Filename`, else the URL's last path segment.
-fn blob_name(d: &DataRef) -> &str {
-    if !d.filename.is_empty() {
-        &d.filename
-    } else {
-        d.url.as_deref().map(url_filename).unwrap_or("")
-    }
-}
-
-fn is_zip(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06")
-}
-
 /// Download a Job.Data blob from its inline URL, caching it under its content hash.
 fn fetch_blob(args: &RunArgs, d: &DataRef) -> Result<Vec<u8>> {
     let url = d
@@ -169,7 +150,7 @@ fn fetch_blob(args: &RunArgs, d: &DataRef) -> Result<Vec<u8>> {
     {
         return Ok(bytes); // cache hit
     }
-    eprintln!("[decryptd] downloading {}", blob_name(d));
+    eprintln!("[decryptd] downloading {}", d.filename);
     let resp = rsurl::Request::new("GET", url)
         .map_err(|e| anyhow!("{e}"))?
         .max_time(Duration::from_secs(300))
@@ -232,21 +213,12 @@ fn run_once(args: &RunArgs, ctx: &RestContext) -> Result<bool> {
     };
     let pull: Pull = serde_json::from_value(data.clone()).context("parsing pullOne response")?;
 
-    // Download the job's blobs and tell engine.zip from data.xz by filename (with a
-    // magic-byte fallback when the URL carries no usable name).
+    // Download the job's blobs; the filename alone tells engine.zip from the data blob.
     let mut engine_zip: Option<Vec<u8>> = None;
     let mut data_xz: Option<Vec<u8>> = None;
     for d in &pull.job.data {
         let bytes = fetch_blob(args, d)?;
-        let name = blob_name(d);
-        let is_engine = if name.ends_with(".zip") {
-            true
-        } else if name.ends_with(".xz") {
-            false
-        } else {
-            is_zip(&bytes)
-        };
-        if is_engine {
+        if d.filename.ends_with(".zip") {
             engine_zip = Some(bytes);
         } else {
             data_xz = Some(bytes);
