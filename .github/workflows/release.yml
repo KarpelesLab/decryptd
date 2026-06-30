@@ -22,11 +22,13 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
+          # Only our binaries — the CUDA toolkit action uploads its own log artifact.
+          pattern: decryptd-*
           merge-multiple: true
 
       - name: Create / update release with binaries
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: dist/decryptd-*
           generate_release_notes: true
           fail_on_unmatched_files: true
