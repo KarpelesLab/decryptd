@@ -55,7 +55,12 @@ You normally don't need any of these.
 | --- | --- | --- |
 | `--once` | off | Do a single chunk of work, then exit (handy for testing). |
 | `--idle-secs <N>` | `60` | How long to wait before re-checking when there's no work. |
+| `--jobs <N>` | `1` | How many chunks to run on the GPU at once. |
 | `--workdir <DIR>` | `decryptd-data` | Where to keep the download cache and scratch files. |
+
+Downloading the next chunk and uploading finished results always happen in the
+background while the GPU works, so the card stays busy. `--jobs` only raises how
+many run *on the GPU* simultaneously — most setups are fine with the default.
 
 Run `decryptd --help` for the full list.
 
