@@ -46,13 +46,16 @@ struct RunArgs {
 }
 
 // ------------------------------------------------------------- pullOne response
-/// `Decrypt/Job:pullOne` payload — a claimed fragment plus its parent job's blobs.
+/// `Decrypt/Job:pullOne` payload — a claimed fragment, its parent job's blobs, and
+/// the single-use key that authenticates this fragment's result submission.
 #[derive(Deserialize)]
 struct Pull {
     #[serde(rename = "Fragment")]
     fragment: Fragment,
     #[serde(rename = "Job")]
     job: Job,
+    #[serde(rename = "Response_Key")]
+    response_key: String,
 }
 #[derive(Deserialize)]
 struct Fragment {
@@ -61,9 +64,6 @@ struct Fragment {
     /// Exclusive — the platform's ranges are half-open `[Range_Start, Range_End)`.
     #[serde(rename = "Range_End", deserialize_with = "de_u64")]
     range_end: u64,
-    /// Single-use handle that authenticates this fragment's result submission.
-    #[serde(rename = "Response_Key")]
-    response_key: String,
 }
 #[derive(Deserialize)]
 struct Job {
@@ -72,12 +72,15 @@ struct Job {
 }
 #[derive(Deserialize)]
 struct DataRef {
-    /// Inline download URL (populated by pullOne).
+    /// Inline signed download URL.
     #[serde(rename = "Url")]
     url: Option<String>,
-    /// Upload key — the blob's content SHA-256, used to verify + cache the download.
-    #[serde(rename = "Key", default)]
-    key: String,
+    /// Original filename — `engine.zip` vs `data.*.xz` tells the two blobs apart.
+    #[serde(rename = "Filename", default)]
+    filename: String,
+    /// Content SHA-256, used to verify + cache the download.
+    #[serde(rename = "Hash", default)]
+    hash: String,
 }
 
 /// BIGINT columns serialize as JSON strings; accept a number too, just in case.
@@ -137,6 +140,15 @@ fn url_filename(url: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// A blob's filename: the explicit `Filename`, else the URL's last path segment.
+fn blob_name(d: &DataRef) -> &str {
+    if !d.filename.is_empty() {
+        &d.filename
+    } else {
+        d.url.as_deref().map(url_filename).unwrap_or("")
+    }
+}
+
 fn is_zip(bytes: &[u8]) -> bool {
     bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06")
 }
@@ -149,15 +161,15 @@ fn fetch_blob(args: &RunArgs, d: &DataRef) -> Result<Vec<u8>> {
         .ok_or_else(|| anyhow!("Job.Data entry has no Url"))?;
     let cache = args.workdir.join("cache");
     std::fs::create_dir_all(&cache)?;
-    // `Key` is the upload-time content SHA-256, so it doubles as a cache key + checksum.
-    let cache_path = (!d.key.is_empty()).then(|| cache.join(&d.key));
+    // `Hash` is the blob's content SHA-256, so it doubles as a cache key + checksum.
+    let cache_path = (!d.hash.is_empty()).then(|| cache.join(&d.hash));
     if let Some(p) = &cache_path
         && let Ok(bytes) = std::fs::read(p)
-        && sha256_hex(&bytes) == d.key
+        && sha256_hex(&bytes) == d.hash
     {
         return Ok(bytes); // cache hit
     }
-    eprintln!("[decryptd] downloading {}", url_filename(url));
+    eprintln!("[decryptd] downloading {}", blob_name(d));
     let resp = rsurl::Request::new("GET", url)
         .map_err(|e| anyhow!("{e}"))?
         .max_time(Duration::from_secs(300))
@@ -166,10 +178,10 @@ fn fetch_blob(args: &RunArgs, d: &DataRef) -> Result<Vec<u8>> {
     if resp.status >= 400 {
         bail!("GET {url} → HTTP {}", resp.status);
     }
-    if !d.key.is_empty() {
+    if !d.hash.is_empty() {
         let got = sha256_hex(&resp.body);
-        if got != d.key {
-            bail!("sha256 mismatch for {url}: got {got}, want {}", d.key);
+        if got != d.hash {
+            bail!("sha256 mismatch for {url}: got {got}, want {}", d.hash);
         }
     }
     if let Some(p) = &cache_path {
@@ -226,7 +238,7 @@ fn run_once(args: &RunArgs, ctx: &RestContext) -> Result<bool> {
     let mut data_xz: Option<Vec<u8>> = None;
     for d in &pull.job.data {
         let bytes = fetch_blob(args, d)?;
-        let name = d.url.as_deref().map(url_filename).unwrap_or("");
+        let name = blob_name(d);
         let is_engine = if name.ends_with(".zip") {
             true
         } else if name.ends_with(".xz") {
@@ -289,7 +301,7 @@ fn run_once(args: &RunArgs, ctx: &RestContext) -> Result<bool> {
         .map_err(|e| anyhow!("xz-compressing result: {e:?}"))?;
     submit_result(
         ctx,
-        &pull.fragment.response_key,
+        &pull.response_key,
         &packed,
         records as u64,
         t0.elapsed().as_secs_f64(),
