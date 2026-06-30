@@ -600,22 +600,17 @@ fn upload_loop(ctx: RestContext, inflight: InFlight, done: Arc<Mutex<Receiver<Fi
     }
 }
 
-/// Trust anchor for self-updates: the 32-byte fingerprint of the decryptd
-/// release signing key (exported with `rsupd id export`). The updater refuses
-/// any release manifest not signed by the matching private identity.
-const RSUPD_FINGERPRINT: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/decryptd.fpr"));
+/// Trust anchor for self-updates: the SHA-256 fingerprint of the decryptd
+/// release signing key (`rsupd id export`). It's a hash of a public key, so it's
+/// safe to embed; the updater refuses any manifest not signed by the matching
+/// private identity.
+const RSUPD_FINGERPRINT: &str = "80b9edc7e6eaebf10b2a25bb10556b9b7fa6abc9fbe556706a2b680cefa4a0fc";
 
-/// Build the signed auto-updater. Its `HttpTransport` fetches the latest signed
-/// manifest and the artifact for this build's target over rsurl from rsupd's
-/// default distribution host.
+/// Build the signed auto-updater. The transport (dist-go over rsurl) and channel
+/// (`master`) default from the fingerprint, so the anchor is the only input.
 fn build_updater() -> rsupd::Result<rsupd::Updater> {
     rsupd::Updater::builder(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
-        .fingerprint(RSUPD_FINGERPRINT)
-        .channel("stable")
-        .transport(Box::new(rsupd::HttpTransport::with_default_base(
-            RSUPD_FINGERPRINT,
-        )))
+        .fingerprint_hex(RSUPD_FINGERPRINT)
         .build()
 }
 

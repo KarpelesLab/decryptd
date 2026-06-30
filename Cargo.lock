@@ -1360,18 +1360,17 @@ dependencies = [
 
 [[package]]
 name = "rsupd"
-version = "0.2.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a64107f9732fb9555597c3972242f59e1f2d13cf63261926a1d3d5a6a1d17cf5"
+checksum = "e4ba3d4d3859d9ebb448311f7f2a9b34d3b8abe5f9bd03aeda24fb827584b258"
 dependencies = [
  "base64 0.21.7",
  "bottlers",
  "ciborium",
  "compcol 0.6.6",
- "klbfw",
  "purecrypto",
  "rsurl",
- "serde_json",
+ "zeroize",
 ]
 
 [[package]]

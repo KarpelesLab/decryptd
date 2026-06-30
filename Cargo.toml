@@ -39,10 +39,10 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # KarpelesLab platform client: the worker claims fragments with Decrypt/Job:pullOne
 # and submits results with :submitFragment, and downloads Decrypt/Data blobs.
 klbfw = "0.1"
-# Signed in-place auto-updater. Its HttpTransport fetches the signed release
-# manifest + artifacts over rsurl; spawn_auto_update keeps long-lived workers
-# current, restarting into each new build.
-rsupd = "0.2"
+# Signed in-place auto-updater. The default transport fetches the signed release
+# manifest + artifacts over rsurl from the dist-go host; spawn_auto_update keeps
+# long-lived workers current, restarting into each new build.
+rsupd = "0.3"
 
 # --- optional GUI (tray-icon) deps, enabled by the `gui` feature ---
 # System-tray presence with a context menu (version / status / quit) on Windows
