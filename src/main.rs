@@ -281,7 +281,7 @@ fn run_once(args: &RunArgs, ctx: &RestContext) -> Result<bool> {
     Ok(true)
 }
 
-/// Submit the fragment's xz-compressed result via `Decrypt/Job:submitFragment`.
+/// Submit the fragment's xz-compressed result via `Decrypt/Job:submit`.
 fn submit_result(
     ctx: &RestContext,
     response_key: &str,
@@ -291,20 +291,20 @@ fn submit_result(
 ) -> Result<()> {
     let mut params: HashMap<String, Value> = HashMap::new();
     params.insert(
-        "responseKey".to_string(),
+        "response_key".to_string(),
         Value::String(response_key.to_string()),
     );
-    // submitFragment goes through the platform's standard upload (prepareCbCtx) flow.
+    // :submit goes through the platform's standard upload (prepareCbCtx) flow.
     klbfw::upload(
         ctx,
-        "Decrypt/Job:submitFragment",
+        "Decrypt/Job:submit",
         "POST",
         params,
         Cursor::new(body.to_vec()),
         "application/x-xz",
         None,
     )
-    .map_err(|e| anyhow!("Decrypt/Job:submitFragment: {e}"))?;
+    .map_err(|e| anyhow!("Decrypt/Job:submit: {e}"))?;
     eprintln!(
         "[decryptd] submitted {records} record(s) ({} B xz) in {secs:.1}s",
         body.len()
@@ -318,7 +318,8 @@ fn main() -> Result<()> {
 
 fn run_worker(args: RunArgs) -> Result<()> {
     std::fs::create_dir_all(&args.workdir)?;
-    let ctx = RestContext::with_config(Config::new("https".to_string(), args.host.clone()));
+    let ctx = RestContext::with_config(Config::new("https".to_string(), args.host.clone()))
+        .with_debug(std::env::var("DECRYPTD_DEBUG").is_ok());
     eprintln!("[decryptd] host={}", args.host);
 
     loop {
