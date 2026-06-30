@@ -1,0 +1,63 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  # Allows release.yml to reuse this exact build matrix.
+  workflow_call:
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            artifact: decryptd-linux-x86_64
+            bin: decryptd
+          - name: windows-x86_64
+            os: windows-latest
+            artifact: decryptd-windows-x86_64.exe
+            bin: decryptd.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Provides the link-time CUDA driver library: the libcuda.so stub on Linux and
+      # cuda.lib on Windows. The runtime libcuda is the NVIDIA driver on the volunteer
+      # machine; CI only needs it to resolve symbols at link time. build.rs picks up
+      # the install via the CUDA_PATH the action exports.
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda
+        with:
+          cuda: "12.6.0"
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
