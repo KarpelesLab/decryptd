@@ -37,6 +37,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The `gui` feature builds the system-tray UI. On Linux that needs GTK 3,
+      # libxdo (cursor/X11 helper used by tray-icon) and an AppIndicator dev
+      # package; Windows links these from the OS, so no extra packages there.
+      - name: Install GUI build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+
       # Provides the link-time CUDA driver library: the libcuda.so stub on Linux and
       # cuda.lib on Windows. The runtime libcuda is the NVIDIA driver on the volunteer
       # machine; CI only needs it to resolve symbols at link time. build.rs picks up
@@ -48,7 +58,8 @@ jobs:
           cuda: "12.6.0"
 
       - name: Build
-        run: cargo build --release --locked
+        # Release binaries ship the system-tray GUI by default.
+        run: cargo build --release --locked --features gui
 
       - name: Package (Linux → tar.gz)
         if: runner.os == 'Linux'

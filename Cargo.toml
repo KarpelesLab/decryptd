@@ -27,10 +27,43 @@ purecrypto = { version = "0.6.7", features = ["hazmat-secp256k1"] }
 # collide on its C FFI symbols (duplicate-symbol link error).
 rsurl = { version = "0.1", features = ["json"] }
 # In-house compression collection: xz for the result (out); the data blob (in)
-# is auto-detected, so pull in the common container formats too.
-compcol = { version = "0.6", features = ["std", "xz", "gzip", "bzip2", "zstd"] }
+# is auto-detected via `factory::detect`, so enable the `factory` runtime
+# decoder lookup plus the container formats we can actually decode.
+# NOTE: only gzip + xz are enabled. compcol 0.6.6's bzip2 decoder fails on real
+# streams (UnexpectedEnd) and its zstd decoder rejects the content-checksum the
+# `zstd` CLI writes by default (Unsupported) — both verified against system-tool
+# output — so enabling them would advertise support that fails at runtime.
+compcol = { version = "0.6", features = ["std", "factory", "xz", "gzip"] }
 # job.zip = the per-arch cubins.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # KarpelesLab platform client: the worker claims fragments with Decrypt/Job:pullOne
 # and submits results with :submitFragment, and downloads Decrypt/Data blobs.
 klbfw = "0.1"
+
+# --- optional GUI (tray-icon) deps, enabled by the `gui` feature ---
+# System-tray presence with a context menu (version / status / quit) on Windows
+# and Linux. tray-icon 0.24 pulls gtk 0.18 on Linux; the loop helpers below are
+# pinned to the SAME gtk/glib minor so we don't link two incompatible gtk copies.
+tray-icon = { version = "0.24", optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", optional = true }
+glib = { version = "0.18", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# Embeds the application icon (and version info) into decryptd.exe. Host-gated:
+# only pulled in when the build *host* is Windows (the release runner), where
+# rc.exe from the MSVC toolchain is available to compile the resource.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[features]
+# Run as a background system-tray app (Windows + Linux) instead of a console
+# worker. The worker pipeline runs on a thread; the tray owns the main thread.
+gui = ["dep:tray-icon", "dep:image", "dep:gtk", "dep:glib", "dep:windows-sys"]

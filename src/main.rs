@@ -1,9 +1,17 @@
+// In the Windows GUI build the worker lives in the tray, so don't attach a
+// console window (which would otherwise flash up on launch). Console/headless
+// builds keep the default subsystem so stderr logging stays visible.
+#![cfg_attr(
+    all(feature = "gui", target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+
 //! `decryptd` — a generic volunteer GPU job runner for decrypt.
 //!
 //! decryptd knows nothing about bloom filters, RNG, or BIP39. It just:
 //!   1. claims a fragment of work from the platform (`Decrypt/Job:pullOne`),
 //!   2. downloads the job's blobs (`engine.zip` + an optional compressed `data`
-//!      blob — xz/gzip/bzip2/zstd, auto-detected) from the inline URLs the pull
+//!      blob — xz or gzip, auto-detected) from the inline URLs the pull
 //!      response carries,
 //!   3. reads launch parameters from `manifest.json` inside `engine.zip`, loads the
 //!      cubin for the local GPU, and launches its kernel over the fragment range
@@ -20,10 +28,13 @@
 //! blob, produced by the job's publisher. See the kernel ABI in `cuda.rs`.
 
 mod cuda;
+#[cfg(all(feature = "gui", any(target_os = "linux", target_os = "windows")))]
+mod gui;
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -245,6 +256,41 @@ struct FinishedJob {
 /// the submit is rejected.
 type InFlight = Arc<Mutex<HashMap<String, String>>>;
 
+/// Shared worker state surfaced to the GUI tray: how many fragments are running
+/// on the GPU right now. Cheap atomics, threaded through the pipeline even in
+/// the headless build (the tray just never reads it there).
+#[derive(Clone, Default)]
+struct Status {
+    /// Count of fragments currently executing on the GPU (0 = waiting for work).
+    active: Arc<AtomicUsize>,
+}
+
+impl Status {
+    /// True while at least one fragment is running on the GPU. Only read by the
+    /// GUI tray; harmless and unused in the headless build.
+    #[cfg_attr(
+        not(all(feature = "gui", any(target_os = "linux", target_os = "windows"))),
+        allow(dead_code)
+    )]
+    fn is_running(&self) -> bool {
+        self.active.load(Ordering::Relaxed) > 0
+    }
+
+    /// Mark a GPU run as started; the returned guard marks it finished on drop
+    /// (so a panic in `run_on_gpu` can't strand the counter above zero).
+    fn run_guard(&self) -> RunGuard {
+        self.active.fetch_add(1, Ordering::Relaxed);
+        RunGuard(self.active.clone())
+    }
+}
+
+struct RunGuard(Arc<AtomicUsize>);
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Claim the next fragment (`pullOne`) and download its blobs. `Ok(None)` means there
 /// was no work — either the platform had none, or it re-issued a fragment we're already
 /// processing (in which case the caller should just back off and retry).
@@ -283,19 +329,19 @@ fn claim_and_fetch(
     // The fragment is now ours; release it from the in-flight set if download fails.
     let fetched = (|| -> Result<ReadyJob> {
         let mut engine_zip: Option<Vec<u8>> = None;
-        let mut data_blob: Option<Vec<u8>> = None;
+        let mut data_blob: Option<(String, Vec<u8>)> = None;
         for d in &pull.job.data {
             let bytes = fetch_blob(args, d)?;
             if d.filename.ends_with(".zip") {
                 engine_zip = Some(bytes);
             } else {
-                data_blob = Some(bytes);
+                data_blob = Some((d.filename.clone(), bytes));
             }
         }
         let engine_zip = engine_zip.ok_or_else(|| anyhow!("job has no engine .zip blob"))?;
         let (manifest, cubins) = unpack_engine(&engine_zip)?;
         let data = match data_blob {
-            Some(blob) => decompress_data(&blob)?,
+            Some((name, blob)) => decompress_data(&name, &blob)?,
             None => Vec::new(),
         };
         Ok(ReadyJob {
@@ -323,28 +369,77 @@ fn claim_and_fetch(
     }
 }
 
-/// Decompress a data blob, auto-detecting the container format from its magic
-/// bytes. The publisher historically shipped `data.xz`, but any of the common
-/// stream formats below works just as well, so we sniff rather than assume.
-/// An uncompressed blob (no recognized magic) is passed through verbatim.
-fn decompress_data(blob: &[u8]) -> Result<Vec<u8>> {
-    let starts = |magic: &[u8]| blob.starts_with(magic);
-    if starts(&[0xFD, b'7', b'z', b'X', b'Z', 0x00]) {
-        compcol::vec::decompress_to_vec::<compcol::xz::Xz>(blob)
-            .map_err(|e| anyhow!("xz-decompressing data: {e:?}"))
-    } else if starts(&[0x1F, 0x8B]) {
-        compcol::vec::decompress_to_vec::<compcol::gzip::Gzip>(blob)
-            .map_err(|e| anyhow!("gzip-decompressing data: {e:?}"))
-    } else if starts(b"BZh") {
-        compcol::vec::decompress_to_vec::<compcol::bzip2::Bzip2>(blob)
-            .map_err(|e| anyhow!("bzip2-decompressing data: {e:?}"))
-    } else if starts(&[0x28, 0xB5, 0x2F, 0xFD]) {
-        compcol::vec::decompress_to_vec::<compcol::zstd::Zstd>(blob)
-            .map_err(|e| anyhow!("zstd-decompressing data: {e:?}"))
-    } else {
-        // No recognized magic — assume the blob is already plaintext.
-        Ok(blob.to_vec())
+/// Decompress a data blob, auto-detecting the container format. The publisher
+/// historically shipped `data.xz`, but gzip works too. The filename extension
+/// takes priority — `data.gz` is treated as gzip regardless of its bytes — and
+/// only when the name is inconclusive (or names a codec we can't build) do we
+/// fall back to `factory::detect` sniffing the leading magic bytes. A blob that
+/// neither names nor looks like a known format is passed through verbatim,
+/// assumed already-plaintext. (Only formats enabled in compcol's features are
+/// usable; see `Cargo.toml`.)
+fn decompress_data(filename: &str, blob: &[u8]) -> Result<Vec<u8>> {
+    // Name first, then content signature. `decoder_by_name` returning `None`
+    // (codec not compiled in) lets a recognized-but-unbuildable extension fall
+    // through to signature detection rather than hard-erroring.
+    let picked = codec_for_extension(filename)
+        .and_then(|name| compcol::factory::decoder_by_name(name).map(|dec| (name, dec)))
+        .or_else(|| {
+            compcol::factory::detect(blob)
+                .and_then(|name| compcol::factory::decoder_by_name(name).map(|dec| (name, dec)))
+        });
+    let Some((name, mut dec)) = picked else {
+        return Ok(blob.to_vec());
+    };
+    decode_stream(dec.as_mut(), blob).map_err(|e| anyhow!("{name}-decompressing data: {e:?}"))
+}
+
+/// Map a filename's extension to the compcol codec name that handles it, or
+/// `None` for an unknown/absent extension. String literals (not the codecs'
+/// `NAME` constants) so this stays valid for formats not compiled in — the
+/// caller turns an unbuildable name into a fall-through to signature detection.
+fn codec_for_extension(filename: &str) -> Option<&'static str> {
+    let ext = filename.rsplit('.').next()?;
+    match ext.to_ascii_lowercase().as_str() {
+        "xz" => Some("xz"),
+        "gz" | "gzip" => Some("gzip"),
+        "bz2" | "bzip2" => Some("bzip2"),
+        "zst" | "zstd" => Some("zstd"),
+        _ => None,
     }
+}
+
+/// Drive a runtime-selected [`compcol::Decoder`] to completion over an in-memory
+/// input. Mirrors `compcol::vec::decompress_to_vec`, which is generic over a
+/// compile-time `Algorithm` and so can't take the boxed decoder `factory`
+/// hands back.
+fn decode_stream(dec: &mut dyn compcol::Decoder, input: &[u8]) -> Result<Vec<u8>, compcol::Error> {
+    use compcol::Status;
+    const SCRATCH: usize = 64 * 1024;
+    let mut out: Vec<u8> = Vec::with_capacity(input.len().saturating_mul(2));
+    let mut scratch = vec![0u8; SCRATCH];
+
+    let mut consumed = 0usize;
+    while consumed < input.len() {
+        let (p, status) = dec.decode(&input[consumed..], &mut scratch)?;
+        out.extend_from_slice(&scratch[..p.written]);
+        consumed += p.consumed;
+        match status {
+            Status::StreamEnd => return Ok(out),
+            Status::InputEmpty => break,
+            Status::OutputFull => continue,
+        }
+    }
+    loop {
+        let (p, status) = dec.finish(&mut scratch)?;
+        out.extend_from_slice(&scratch[..p.written]);
+        if matches!(status, Status::StreamEnd) {
+            break;
+        }
+        if p.written == 0 {
+            return Err(compcol::Error::Corrupt);
+        }
+    }
+    Ok(out)
 }
 
 /// Run one ready fragment on the GPU. Creates its own CUDA context, so multiple of
@@ -452,6 +547,7 @@ fn run_loop(
     ready: Arc<Mutex<Receiver<ReadyJob>>>,
     inflight: InFlight,
     done: SyncSender<FinishedJob>,
+    status: Status,
 ) {
     loop {
         let job = match ready.lock().unwrap().recv() {
@@ -459,6 +555,8 @@ fn run_loop(
             Err(_) => return, // prefetcher gone
         };
         let frag_id = job.frag_id.clone();
+        // Flip the tray status to "Running" for the duration of this GPU run.
+        let _running = status.run_guard();
         match run_on_gpu(job) {
             Ok(finished) => {
                 if done.send(finished).is_err() {
@@ -503,10 +601,20 @@ fn upload_loop(ctx: RestContext, inflight: InFlight, done: Arc<Mutex<Receiver<Fi
 }
 
 fn main() -> Result<()> {
-    run_worker(RunArgs::parse())
+    let args = RunArgs::parse();
+    let status = Status::default();
+
+    // GUI build (Windows/Linux): unless `--once`, hand the main thread to the
+    // system-tray event loop and run the worker pipeline behind it.
+    #[cfg(all(feature = "gui", any(target_os = "linux", target_os = "windows")))]
+    if !args.once {
+        return gui::run_with_tray(args, status);
+    }
+
+    run_worker(args, status)
 }
 
-fn run_worker(args: RunArgs) -> Result<()> {
+fn run_worker(args: RunArgs, status: Status) -> Result<()> {
     std::fs::create_dir_all(&args.workdir)?;
     let ctx = RestContext::with_config(Config::new("https".to_string(), args.host.clone()))
         .with_debug(std::env::var("DECRYPTD_DEBUG").is_ok());
@@ -548,7 +656,10 @@ fn run_worker(args: RunArgs) -> Result<()> {
     let mut runners = Vec::new();
     for _ in 0..jobs {
         let (ready_rx, inflight, done_tx) = (ready_rx.clone(), inflight.clone(), done_tx.clone());
-        runners.push(thread::spawn(move || run_loop(ready_rx, inflight, done_tx)));
+        let status = status.clone();
+        runners.push(thread::spawn(move || {
+            run_loop(ready_rx, inflight, done_tx, status)
+        }));
     }
     drop(done_tx);
 

@@ -1,9 +1,32 @@
-//! Link the CUDA driver (libcuda) for decryptd's generic launch path. No nvcc is
-//! used — decryptd only needs the NVIDIA driver (which every volunteer has).
+//! Build script: links the CUDA driver (libcuda) for decryptd's generic launch
+//! path — no nvcc, only the NVIDIA driver every volunteer already has — and, on
+//! Windows, embeds the application icon into the executable.
 
 use std::path::Path;
 
 fn main() {
+    link_cuda();
+    embed_windows_icon();
+}
+
+/// Embed the application icon into `decryptd.exe` so it shows up in Explorer, the
+/// taskbar, and the tray. Compiled only when the build host is Windows (where
+/// `winresource` and rc.exe exist); a no-op everywhere else, including when
+/// cross-compiling a Windows target from Linux.
+#[cfg(windows)]
+fn embed_windows_icon() {
+    println!("cargo:rerun-if-changed=assets/decryptd.ico");
+    let mut res = winresource::WindowsResource::new();
+    res.set_icon("assets/decryptd.ico");
+    if let Err(e) = res.compile() {
+        println!("cargo:warning=failed to embed Windows icon: {e}");
+    }
+}
+
+#[cfg(not(windows))]
+fn embed_windows_icon() {}
+
+fn link_cuda() {
     // Rerun when the relevant env vars change so CI/local installs are picked up.
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
