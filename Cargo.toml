@@ -38,7 +38,8 @@ compcol = { version = "0.6", features = ["std", "factory", "xz", "gzip"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # KarpelesLab platform client: the worker claims fragments with Decrypt/Job:pullOne
 # and submits results with :submitFragment, and downloads Decrypt/Data blobs.
-klbfw = "0.1"
+# 0.1.2 fixes a critical upload bug (result submission).
+klbfw = "0.1.2"
 # Signed in-place auto-updater. The default transport fetches the signed release
 # manifest + artifacts over rsurl from the dist-go host; spawn_auto_update keeps
 # long-lived workers current, restarting into each new build.

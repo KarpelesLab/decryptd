@@ -925,9 +925,9 @@ dependencies = [
 
 [[package]]
 name = "klbfw"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6516247c320d22a209f7433996a26a38fb84414fb44ea4519e095372b56262c"
+checksum = "3d4e42f0f65326809c37a270ca331e9b842eafc1081b97a69a09846e987702e4"
 dependencies = [
  "base64 0.21.7",
  "chrono",
