@@ -51,6 +51,9 @@ rsupd = "0.3"
 # pinned to the SAME gtk/glib minor so we don't link two incompatible gtk copies.
 tray-icon = { version = "0.24", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+# Desktop notification on launch (and a fallback when the tray is unavailable).
+# Pure-Rust zbus backend on Linux (no C FFI to collide on) / WinRT toast on Windows.
+notify-rust = { version = "4", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = { version = "0.18", optional = true }
@@ -71,4 +74,4 @@ winresource = "0.1"
 [features]
 # Run as a background system-tray app (Windows + Linux) instead of a console
 # worker. The worker pipeline runs on a thread; the tray owns the main thread.
-gui = ["dep:tray-icon", "dep:image", "dep:gtk", "dep:glib", "dep:windows-sys"]
+gui = ["dep:tray-icon", "dep:image", "dep:gtk", "dep:glib", "dep:windows-sys", "dep:notify-rust"]
