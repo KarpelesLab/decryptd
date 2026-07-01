@@ -6,7 +6,7 @@ license = "Proprietary"
 authors = ["Karpeles Lab Inc"]
 repository = "https://github.com/KarpelesLab/decryptd"
 rust-version = "1.95"
-description = "Generic volunteer GPU job runner for decrypt"
+description = "decryptd — GPU job runner for decrypt"
 build = "build.rs"
 
 # NOTE: links the CUDA driver (libcuda) for the generic launch path. No nvcc/toolkit

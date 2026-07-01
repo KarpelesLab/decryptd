@@ -1,6 +1,6 @@
 # decryptd
 
-A volunteer GPU worker for **decrypt**. Run it on a machine with an NVIDIA GPU
+A GPU worker for **decrypt**. Run it on a machine with an NVIDIA GPU
 and it quietly does distributed compute jobs in the background: it asks the
 coordinator for a chunk of work, runs it on your GPU, sends the result back, and
 repeats — forever, until you stop it. Run and forget.

@@ -6,7 +6,7 @@
     windows_subsystem = "windows"
 )]
 
-//! `decryptd` — a generic volunteer GPU job runner for decrypt.
+//! `decryptd` — a GPU job runner for decrypt.
 //!
 //! decryptd knows nothing about bloom filters, RNG, or BIP39. It just:
 //!   1. claims a fragment of work from the platform (`Decrypt/Job:pullOne`),

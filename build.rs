@@ -1,6 +1,6 @@
 //! Build script: links the CUDA driver (libcuda) for decryptd's generic launch
-//! path — no nvcc, only the NVIDIA driver every volunteer already has — and, on
-//! Windows, embeds the application icon into the executable.
+//! path — no nvcc, only the NVIDIA driver — and, on Windows, embeds the
+//! application icon into the executable.
 
 use std::path::Path;
 use std::process::Command;
