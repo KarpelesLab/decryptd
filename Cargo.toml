@@ -1,6 +1,6 @@
 [package]
 name = "decryptd"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 license = "Proprietary"
 authors = ["Karpeles Lab Inc"]
@@ -19,6 +19,9 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+# Decoding inline `data:` blob URLs the platform sometimes hands back in place of
+# a presigned HTTP URL (small blobs shipped inline instead of via S3).
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

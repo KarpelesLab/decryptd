@@ -190,6 +190,27 @@ fn fetch_blob(args: &RunArgs, d: &DataRef) -> Result<Vec<u8>> {
         .url
         .as_deref()
         .ok_or_else(|| anyhow!("Job.Data entry has no Url"))?;
+
+    // The platform inlines small blobs as `data:` URIs instead of a presigned
+    // HTTP URL. rsurl only speaks HTTP(S), so decode these ourselves rather than
+    // handing an unsupported scheme to the downloader. The payload is already in
+    // hand, so there's nothing to cache or resume — just decode and (if the row
+    // carries one) verify the content hash.
+    if url.starts_with("data:") {
+        let bytes = decode_data_url(url)?;
+        if !d.hash.is_empty() {
+            let got = sha256_hex(&bytes);
+            if got != d.hash {
+                bail!(
+                    "data: URL hash mismatch for {}: {got} != {}",
+                    d.filename,
+                    d.hash
+                );
+            }
+        }
+        return Ok(bytes);
+    }
+
     let cache = args.workdir.join("cache");
     std::fs::create_dir_all(&cache)?;
     // `Hash` is the blob's content SHA-256, so it doubles as a cache key + checksum.
@@ -222,6 +243,62 @@ fn fetch_blob(args: &RunArgs, d: &DataRef) -> Result<Vec<u8>> {
         let _ = std::fs::remove_file(&target);
     }
     Ok(bytes)
+}
+
+/// Decode an RFC 2397 `data:` URI into its raw bytes. Handles the two payload
+/// encodings: `;base64` (the platform's case — base64 over the gzip/xz blob) and
+/// the default percent-encoding. The media type in the header is ignored; the
+/// caller's filename/signature detection picks the container format downstream.
+fn decode_data_url(url: &str) -> Result<Vec<u8>> {
+    use base64::Engine;
+    let body = url
+        .strip_prefix("data:")
+        .ok_or_else(|| anyhow!("not a data: URL"))?;
+    // `data:[<mediatype>][;base64],<payload>` — split on the first comma.
+    let (header, payload) = body
+        .split_once(',')
+        .ok_or_else(|| anyhow!("malformed data: URL (no comma)"))?;
+    if header
+        .rsplit(';')
+        .any(|seg| seg.eq_ignore_ascii_case("base64"))
+    {
+        // Base64 may carry embedded whitespace (line wrapping); strip it first.
+        let cleaned: String = payload
+            .chars()
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect();
+        base64::engine::general_purpose::STANDARD
+            .decode(cleaned.as_bytes())
+            .map_err(|e| anyhow!("decoding base64 data: URL: {e}"))
+    } else {
+        percent_decode(payload)
+    }
+}
+
+/// Percent-decode a (non-base64) `data:` URL payload into raw bytes.
+fn percent_decode(s: &str) -> Result<Vec<u8>> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                let hex = s
+                    .get(i + 1..i + 3)
+                    .ok_or_else(|| anyhow!("truncated percent-escape in data: URL"))?;
+                out.push(
+                    u8::from_str_radix(hex, 16)
+                        .map_err(|_| anyhow!("invalid percent-escape %{hex} in data: URL"))?,
+                );
+                i += 3;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Unpack engine.zip: parse `manifest.json` and collect every `*.sm<NN>.cubin`'s
@@ -727,4 +804,37 @@ fn run_worker(args: RunArgs, status: Status) -> Result<()> {
         let _ = r.join();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The exact inline blob the platform handed back in the field, which rsurl
+    // rejected as an "invalid URL": a gzip stream of a `PCB1`-tagged data blob.
+    const SAMPLE: &str = "data:application/gzip;base64,H4sIAAAAAAAA/wtwdjJkAAJ2II4DYg0GCLjZF1uzaFNdxUHdh20rfjCvjDa0uNC6SVJlcaczH+MpkezyD6pK2ySFYhWVlFVU1dQ1NLW0dXT19A0MjYxNTM3MLSytrG1s7ewdHJ2cXVzd3D08vbx9fP38AwKDgkNCw8IjIqOiY2Lj4hMSk5JTUtPSMzKzsnNy8/ILCouKS0rLyisqq6prausAYVRJS54AAAA=";
+
+    #[test]
+    fn data_url_base64_gzip_roundtrips() {
+        let gz = decode_data_url(SAMPLE).expect("decode");
+        // Decodes to a real gzip stream (magic 1f 8b) that our data-blob
+        // decompressor unpacks to the `PCB1`-tagged payload.
+        assert_eq!(&gz[..2], &[0x1f, 0x8b], "gzip magic");
+        let plain = decompress_data("blob.gz", &gz).expect("gunzip");
+        assert_eq!(&plain[..4], b"PCB1", "unpacked blob tag");
+    }
+
+    #[test]
+    fn data_url_percent_encoded() {
+        let bytes = decode_data_url("data:text/plain,a%20b%2Fc").expect("decode");
+        assert_eq!(bytes, b"a b/c");
+    }
+
+    #[test]
+    fn data_url_base64_case_insensitive_and_whitespace() {
+        // ";BASE64" and wrapped payload both tolerated.
+        let bytes =
+            decode_data_url("data:application/octet-stream;BASE64,aGVs\nbG8=").expect("decode");
+        assert_eq!(bytes, b"hello");
+    }
 }
