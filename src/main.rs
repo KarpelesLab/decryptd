@@ -33,7 +33,7 @@ mod cuda;
 #[cfg(all(feature = "gui", any(target_os = "linux", target_os = "windows")))]
 mod gui;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -512,6 +512,55 @@ struct Status {
     /// a fatal stop. Surfaced in the tray so a Windows user (whose console logs are
     /// swallowed by the GUI subsystem) can tell an idle worker from a broken one.
     note: Arc<Mutex<String>>,
+    /// Rolling count of work items ("tries") run on the GPU, for a live rate in
+    /// the tray. Fed per kernel tile by every GPU, so it aggregates across them.
+    tries: Arc<Throughput>,
+}
+
+/// Timestamped record of GPU work items, for a ~1-minute average "tries/second".
+/// Fed per kernel tile (not per fragment) so the rate stays smooth even while a
+/// single multi-hundred-billion-item fragment runs for minutes.
+#[derive(Default)]
+struct Throughput {
+    /// `(instant, cumulative items)` samples spanning the window; the front is the
+    /// window anchor, the back the latest total. Bounded to ~[`Self::WINDOW`].
+    samples: Mutex<VecDeque<(Instant, u64)>>,
+}
+
+impl Throughput {
+    const WINDOW: Duration = Duration::from_secs(60);
+
+    /// Add `items` just completed on the GPU (per tile). O(1) amortized.
+    fn record(&self, items: u64) {
+        if items == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let mut s = self.samples.lock().unwrap();
+        let cum = s.back().map(|&(_, c)| c).unwrap_or(0) + items;
+        s.push_back((now, cum));
+        // Keep exactly one sample older than the window as the rate anchor.
+        while s.len() > 2
+            && s.get(1)
+                .is_some_and(|&(t, _)| now.duration_since(t) >= Self::WINDOW)
+        {
+            s.pop_front();
+        }
+    }
+
+    /// Average items/second across the retained window (up to ~1 min), or `None`
+    /// until two samples span a positive interval. Only read by the GUI tray.
+    #[cfg_attr(
+        not(all(feature = "gui", any(target_os = "linux", target_os = "windows"))),
+        allow(dead_code)
+    )]
+    fn per_sec(&self) -> Option<f64> {
+        let s = self.samples.lock().unwrap();
+        let (t0, c0) = *s.front()?;
+        let (t1, c1) = *s.back()?;
+        let dt = t1.duration_since(t0).as_secs_f64();
+        (dt > 0.0).then(|| (c1 - c0) as f64 / dt)
+    }
 }
 
 impl Status {
@@ -550,6 +599,21 @@ impl Status {
         while self.paused.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(200));
         }
+    }
+
+    /// Record `items` work items just run on the GPU (fed per kernel tile).
+    fn record_tries(&self, items: u64) {
+        self.tries.record(items);
+    }
+
+    /// Recent GPU throughput in items/second (~1-minute average), or `None` when
+    /// nothing has run recently. Only read by the GUI tray.
+    #[cfg_attr(
+        not(all(feature = "gui", any(target_os = "linux", target_os = "windows"))),
+        allow(dead_code)
+    )]
+    fn tries_per_sec(&self) -> Option<f64> {
+        self.tries.per_sec()
     }
 
     /// Record why the worker is idle (shown in the tray). Set by the pipeline on
@@ -763,7 +827,15 @@ fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJo
         job.manifest.out_cap,
         job.manifest.block,
         job.manifest.tile,
-        |_done, _total| {},
+        {
+            // Feed the tray's rate meter per tile: record the item delta since the
+            // last callback (`done` is cumulative within the fragment).
+            let mut reported = 0u64;
+            move |done, _total| {
+                status.record_tries(done.saturating_sub(reported));
+                reported = done;
+            }
+        },
         // Between tiles, park here while paused so the GPU stops computing
         // promptly and the current fragment resumes losslessly.
         || status.wait_while_paused(),
@@ -1167,6 +1239,25 @@ mod tests {
         assert_eq!(load_or_create_worker_id(&dir).unwrap(), "my-pinned-id");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn throughput_reports_a_positive_rate() {
+        let t = Throughput::default();
+        assert!(t.per_sec().is_none(), "no rate before any samples");
+        t.record(0); // ignored
+        t.record(1_000_000);
+        thread::sleep(Duration::from_millis(30));
+        t.record(1_000_000);
+        let r = t.per_sec().expect("a rate after two spaced samples");
+        // ~2M items over ~30ms; timing is loose, so only assert it's a sane rate.
+        assert!(r > 0.0, "rate should be positive, got {r}");
+        // The window keeps the deque bounded — a burst of samples collapses to the
+        // anchor + recents, never unbounded.
+        for _ in 0..1000 {
+            t.record(1);
+        }
+        assert!(t.samples.lock().unwrap().len() <= 1002);
     }
 
     #[test]

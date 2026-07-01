@@ -167,6 +167,22 @@ fn status_label(status: &Status) -> String {
     format!("Status: {note}")
 }
 
+/// Format an items/second rate with an SI-ish suffix — GPU rates run into the
+/// billions, so the raw number is unreadable.
+fn fmt_rate(r: f64) -> String {
+    if r >= 1e12 {
+        format!("{:.2} T/s", r / 1e12)
+    } else if r >= 1e9 {
+        format!("{:.2} G/s", r / 1e9)
+    } else if r >= 1e6 {
+        format!("{:.1} M/s", r / 1e6)
+    } else if r >= 1e3 {
+        format!("{:.1} k/s", r / 1e3)
+    } else {
+        format!("{r:.0}/s")
+    }
+}
+
 /// The Pause/Resume toggle's label, matching the current flag.
 fn pause_label(status: &Status) -> &'static str {
     if status.is_paused() {
@@ -182,8 +198,15 @@ fn pause_label(status: &Status) -> &'static str {
 fn build_menu(status: &Status, gpu_labels: &[String]) -> Menu {
     let mut menu = Menu::new()
         .item(MenuItem::button(ID_INERT, format!("decryptd v{VERSION}")).enabled(false))
-        .item(MenuItem::button(ID_INERT, status_label(status)).enabled(false))
-        .item(MenuItem::separator());
+        .item(MenuItem::button(ID_INERT, status_label(status)).enabled(false));
+    // Live throughput (1-minute average), shown once there's something to report.
+    if let Some(rate) = status.tries_per_sec() {
+        menu = menu.item(
+            MenuItem::button(ID_INERT, format!("Speed: {} (1m avg)", fmt_rate(rate)))
+                .enabled(false),
+        );
+    }
+    menu = menu.item(MenuItem::separator());
     // One disabled line per GPU decryptd is using.
     for label in gpu_labels {
         menu = menu.item(MenuItem::button(ID_INERT, label.clone()).enabled(false));
