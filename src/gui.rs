@@ -85,7 +85,12 @@ fn build_tray(status: &Status) -> Result<(TrayIcon, MenuItem, MenuId, MenuId)> {
     // The tray is live now — tell the user where to look for it.
     notify_running();
 
-    Ok((tray, status_item, check_updates.id().clone(), quit.id().clone()))
+    Ok((
+        tray,
+        status_item,
+        check_updates.id().clone(),
+        quit.id().clone(),
+    ))
 }
 
 /// Pop a desktop notification announcing that the app is up, pointing the user
