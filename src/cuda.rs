@@ -16,6 +16,7 @@
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr;
+use std::time::{Duration, Instant};
 
 type CuResult = i32;
 type CuDevice = i32;
@@ -296,6 +297,12 @@ impl Drop for Gpu {
 /// reports per-tile progress via `progress(done, total)`. `gate` is called before
 /// each tile launch: it blocks while the worker is paused, so a long fragment stops
 /// computing promptly and resumes on the next tile without losing progress.
+///
+/// `timeout` bounds the *active* compute time of the whole fragment: checked between
+/// tiles (paused time excluded), it aborts a fragment that never converges so a
+/// runaway job can't pin a GPU forever. The bound is per-tile-granular — a single
+/// tile already in flight runs to completion (a blocking `cuCtxSynchronize` can't be
+/// interrupted), so keep tiles small enough that one tile is well under the limit.
 #[allow(clippy::too_many_arguments)]
 pub fn run_job(
     gpu: &Gpu,
@@ -307,6 +314,7 @@ pub fn run_job(
     out_cap: u32,
     block: u32,
     tile: u64,
+    timeout: Duration,
     mut progress: impl FnMut(u64, u64),
     gate: impl Fn(),
 ) -> Result<Vec<u8>, String> {
@@ -331,8 +339,22 @@ pub fn run_job(
     let mut results = Vec::new();
     let mut done = 0u64;
     let mut cur = start;
+    // Wall-clock budget for this fragment, minus any time spent parked in `gate`
+    // (a paused worker must not time out). Checked once per tile below.
+    let started = Instant::now();
+    let mut paused = Duration::ZERO;
     while cur <= end_incl {
+        let park = Instant::now();
         gate(); // park here while paused (no kernel launched until resumed)
+        paused += park.elapsed();
+        let active = started.elapsed().saturating_sub(paused);
+        if active >= timeout {
+            return Err(format!(
+                "timed out after {:.0}s (limit {:.0}s) at {done}/{total} items",
+                active.as_secs_f64(),
+                timeout.as_secs_f64(),
+            ));
+        }
         let count = ((end_incl - cur).saturating_add(1)).min(tile);
         d_count.memset0()?;
         let (mut a_start, mut a_count) = (cur, count);

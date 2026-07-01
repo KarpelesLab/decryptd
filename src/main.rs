@@ -822,6 +822,12 @@ fn decode_stream(dec: &mut dyn compcol::Decoder, input: &[u8]) -> Result<Vec<u8>
 /// Run one ready fragment on GPU `ordinal`. Creates its own CUDA context on the
 /// calling thread, so multiple of these run concurrently across `--jobs` runners
 /// and across GPUs.
+/// Cap on active compute time for a single fragment. A fragment that hasn't
+/// finished within this bound is aborted (dropped, not submitted) so a runaway or
+/// mis-sized job can't hold a GPU indefinitely; the worker backs off and claims the
+/// next. Paused time doesn't count against it (see [`cuda::run_job`]).
+const JOB_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
 fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJob> {
     let gpu = cuda::Gpu::load_first(ordinal, &job.cubins).map_err(|e| anyhow!(e))?;
     let (maj, min) = gpu.compute_capability();
@@ -842,6 +848,7 @@ fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJo
         job.manifest.out_cap,
         job.manifest.block,
         job.manifest.tile,
+        JOB_TIMEOUT,
         {
             // Feed the tray's rate meter per tile: record the item delta since the
             // last callback (`done` is cumulative within the fragment).
