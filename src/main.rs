@@ -121,6 +121,10 @@ fn de_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
 }
 
 // ----------------------------------------------------------------- engine.zip
+/// An arch-tagged cubin from `engine.zip`: compute capability `X.Y` encoded as
+/// `X*10+Y` (matching the `smNN` filename tag), paired with the raw cubin bytes.
+type Cubin = (u32, Vec<u8>);
+
 /// `manifest.json` shipped inside `engine.zip` — the generic kernel launch
 /// parameters that the platform's Decrypt/Job row does not carry.
 #[derive(Deserialize)]
@@ -301,9 +305,11 @@ fn percent_decode(s: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Unpack engine.zip: parse `manifest.json` and collect every `*.sm<NN>.cubin`'s
-/// bytes, highest compute-capability first.
-fn unpack_engine(zip_bytes: &[u8]) -> Result<(Manifest, Vec<Vec<u8>>)> {
+/// Unpack engine.zip: parse `manifest.json` and collect every `*.sm<NN>.cubin` as
+/// an `(arch, bytes)` pair, highest compute-capability first. The arch tag rides
+/// along so the GPU loader can skip cubins newer than the device (see
+/// [`cuda::Gpu::load_first`]) instead of handing them to a driver that may crash.
+fn unpack_engine(zip_bytes: &[u8]) -> Result<(Manifest, Vec<Cubin>)> {
     let mut zip = zip::ZipArchive::new(Cursor::new(zip_bytes)).context("opening engine.zip")?;
     let mut manifest: Option<Manifest> = None;
     let mut cubins: Vec<(u32, Vec<u8>)> = Vec::new();
@@ -328,7 +334,7 @@ fn unpack_engine(zip_bytes: &[u8]) -> Result<(Manifest, Vec<Vec<u8>>)> {
         bail!("engine.zip contains no *.sm<NN>.cubin files");
     }
     cubins.sort_by_key(|c| std::cmp::Reverse(c.0));
-    Ok((manifest, cubins.into_iter().map(|(_, b)| b).collect()))
+    Ok((manifest, cubins))
 }
 
 // --------------------------------------------------------------------------- run
@@ -338,7 +344,8 @@ struct ReadyJob {
     start: u64,
     end: u64,
     manifest: Manifest,
-    cubins: Vec<Vec<u8>>,
+    /// Arch-tagged cubins, highest arch first (see [`Cubin`]).
+    cubins: Vec<Cubin>,
     data: Vec<u8>,
 }
 

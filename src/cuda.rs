@@ -127,17 +127,42 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    /// Init device 0 and load the first cubin the driver accepts (callers pass them
-    /// highest-arch-first; a cubin for sm_X.y loads only on CC X.z, z≥y).
-    pub fn load_first(cubins: &[Vec<u8>]) -> Result<Gpu, String> {
+    /// Init device 0 and load the best cubin for it. Callers pass `(arch, bytes)`
+    /// pairs highest-arch-first, where arch is CC `X.Y` encoded as `X*10+Y`.
+    ///
+    /// Cubins newer than the device are skipped rather than tried: an old driver
+    /// (e.g. 550.x / CUDA 12.4) doesn't cleanly reject a cubin for an architecture
+    /// it has never heard of — `cuModuleLoadData` faults with SIGILL *inside*
+    /// libcuda. So we query the GPU's compute capability first and never hand the
+    /// driver anything above it. Same-major-lower cubins that still don't load
+    /// (a known arch the driver rejects) fall through to the next candidate.
+    pub fn load_first(cubins: &[(u32, Vec<u8>)]) -> Result<Gpu, String> {
         unsafe {
             check(cuInit(0), "cuInit")?;
             let mut dev: CuDevice = 0;
             check(cuDeviceGet(&mut dev, 0), "cuDeviceGet")?;
+
+            // Device compute capability, encoded to match the `smNN` tags.
+            let (mut maj, mut min) = (0i32, 0i32);
+            check(
+                cuDeviceGetAttribute(&mut maj, CU_DEV_ATTR_CC_MAJOR, dev),
+                "cuDeviceGetAttribute(CC_MAJOR)",
+            )?;
+            check(
+                cuDeviceGetAttribute(&mut min, CU_DEV_ATTR_CC_MINOR, dev),
+                "cuDeviceGetAttribute(CC_MINOR)",
+            )?;
+            let gpu_arch = (maj.max(0) as u32) * 10 + (min.max(0) as u32);
+
             let mut ctx: CuContext = ptr::null_mut();
             check(cuCtxCreate_v2(&mut ctx, 0, dev), "cuCtxCreate")?;
-            let mut last = String::from("no cubins provided");
-            for cubin in cubins {
+            let mut last = format!("no cubin for sm_{gpu_arch} or older in engine.zip");
+            for (arch, cubin) in cubins {
+                // Never feed the driver an arch newer than the GPU — it can't run
+                // here anyway, and a beyond-driver arch can hard-crash libcuda.
+                if *arch > gpu_arch {
+                    continue;
+                }
                 let mut module: CuModule = ptr::null_mut();
                 let r = cuModuleLoadData(&mut module, cubin.as_ptr() as *const c_void);
                 if r == 0 {
@@ -146,7 +171,7 @@ impl Gpu {
                 last = check(r, "cuModuleLoadData").unwrap_err();
             }
             cuCtxDestroy_v2(ctx);
-            Err(format!("no cubin loaded on this GPU ({last})"))
+            Err(format!("no cubin loaded on sm_{gpu_arch} ({last})"))
         }
     }
 
