@@ -33,6 +33,7 @@ unsafe extern "C" {
     fn cuCtxCreate_v2(pctx: *mut CuContext, flags: u32, dev: CuDevice) -> CuResult;
     fn cuCtxDestroy_v2(ctx: CuContext) -> CuResult;
     fn cuModuleLoadData(module: *mut CuModule, image: *const c_void) -> CuResult;
+    fn cuModuleUnload(module: CuModule) -> CuResult;
     fn cuModuleGetFunction(
         func: *mut CuFunction,
         module: CuModule,
@@ -120,7 +121,6 @@ impl Drop for DeviceBuf {
 
 /// An initialized CUDA context with a module loaded.
 pub struct Gpu {
-    #[allow(dead_code)]
     ctx: CuContext,
     module: CuModule,
     dev: CuDevice,
@@ -204,6 +204,20 @@ impl Gpu {
             &format!("cuModuleGetFunction({name})"),
         )?;
         Ok(f)
+    }
+}
+
+impl Drop for Gpu {
+    /// Release the module and context. Without this every finished fragment leaks
+    /// its CUDA context; after enough fragments `cuCtxCreate` starts failing with
+    /// `out of memory` (each context reserves device memory) and no further work
+    /// runs. `cuCtxDestroy` alone frees the module too, but unload it explicitly
+    /// so the ordering mirrors acquisition.
+    fn drop(&mut self) {
+        unsafe {
+            cuModuleUnload(self.module);
+            cuCtxDestroy_v2(self.ctx);
+        }
     }
 }
 
@@ -305,5 +319,35 @@ impl DeviceBufView {
             unsafe { cuMemcpyDtoH_v2(dst.as_mut_ptr() as *mut c_void, self.ptr, n) },
             "cuMemcpyDtoH",
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the leaked-context OOM: create and drop a `Gpu` many
+    /// times and confirm `cuCtxCreate` keeps succeeding. Before `Drop for Gpu`,
+    /// each iteration leaked its context and this loop died with "out of memory"
+    /// after a few dozen rounds. Needs a real GPU + a cubin, so it's `#[ignore]`d;
+    /// run manually with the cubin path in DECRYPTD_TEST_CUBIN:
+    ///   DECRYPTD_TEST_CUBIN=/path/to/x.sm89.cubin cargo test --release -- --ignored gpu_context
+    #[test]
+    #[ignore]
+    fn gpu_context_is_freed_across_runs() {
+        let Ok(path) = std::env::var("DECRYPTD_TEST_CUBIN") else {
+            panic!("set DECRYPTD_TEST_CUBIN to a cubin matching this GPU's arch");
+        };
+        let bytes = std::fs::read(&path).expect("read cubin");
+        // Tag arch 0 so the "skip cubins newer than the GPU" filter always keeps
+        // it; the real cubin must still match this GPU for cuModuleLoadData.
+        let cubins = vec![(0u32, bytes)];
+        for i in 0..64 {
+            let gpu = Gpu::load_first(&cubins)
+                .unwrap_or_else(|e| panic!("iteration {i}: load_first failed: {e}"));
+            // Touch it so the context is really used, then drop at end of scope.
+            let _ = gpu.compute_capability();
+            drop(gpu);
+        }
     }
 }
