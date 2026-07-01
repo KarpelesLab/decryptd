@@ -20,8 +20,10 @@
 //!      `Decrypt/Job:submit`.
 //!
 //! These stages are pipelined: the next fragment downloads while the GPU runs the
-//! current one, and finished results upload while the GPU runs the next. Only the GPU
-//! run itself is serialized (one at a time unless `--jobs > 1`).
+//! current one, and finished results upload while the GPU runs the next. Each GPU
+//! gets its own independent pipeline (prefetch → run → upload), and `--jobs` sets
+//! how many fragments run concurrently *on each* GPU; a shared in-flight set and
+//! blob-download map keep the GPUs from duplicating each other's work.
 //!
 //! `pullOne`/`submit` and the `Decrypt/Data` blobs are anonymous-accessible, so a
 //! worker needs no credentials. All job-specific logic lives in the cubin + the data
@@ -62,10 +64,15 @@ struct RunArgs {
     /// Seconds to wait before retrying when no work is available.
     #[arg(long, default_value_t = 60)]
     idle_secs: u64,
-    /// Number of GPU jobs to run concurrently (default: one at a time). Download of
-    /// the next job and upload of finished results always overlap the GPU run.
+    /// Number of GPU jobs to run concurrently **per GPU** (default: one at a time).
+    /// Download of the next job and upload of finished results always overlap the
+    /// GPU run. With N GPUs in use this is N×jobs concurrent runs in total.
     #[arg(long, default_value_t = 1)]
     jobs: usize,
+    /// Comma-separated GPU ordinals to use, e.g. "0,2". Default: every detected
+    /// GPU. Ordinals are post-`CUDA_VISIBLE_DEVICES`. Each gets its own work queue.
+    #[arg(long)]
+    gpus: Option<String>,
     /// Maximum on-disk blob cache size, in GB. Once exceeded, the oldest cached
     /// blobs are evicted. Eviction is safe: a running job holds its blob in memory,
     /// so the only cost of dropping a file is a re-download on a later cache miss.
@@ -194,7 +201,7 @@ fn parse_sha256_hex(hex: &str) -> Option<[u8; 32]> {
 /// a `HEAD`, but these blob URLs are SigV4-presigned for `GET` only, so a
 /// `HEAD` returns 403. A plain `GET` stream still gets the essentials — no
 /// size cap, and `Range`-based resume on a drop.
-fn fetch_blob(args: &RunArgs, d: &DataRef) -> Result<Vec<u8>> {
+fn fetch_blob(args: &RunArgs, downloads: &Downloads, d: &DataRef) -> Result<Vec<u8>> {
     let url = d
         .url
         .as_deref()
@@ -230,6 +237,33 @@ fn fetch_blob(args: &RunArgs, d: &DataRef) -> Result<Vec<u8>> {
     {
         return Ok(bytes); // cache hit
     }
+
+    // Serialize downloaders of the same content hash across all GPUs' prefetch
+    // threads (they share this cache). `hash_lock` is held for the whole
+    // download so a peer targeting the same blob waits here rather than racing
+    // on the same file; it's declared before `_guard` so the Arc outlives the
+    // guard that borrows it.
+    let hash_lock = (!d.hash.is_empty()).then(|| {
+        downloads
+            .lock()
+            .unwrap()
+            .entry(d.hash.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    });
+    let _guard = hash_lock
+        .as_ref()
+        .map(|l| l.lock().unwrap_or_else(|e| e.into_inner()));
+    // A peer may have finished the download while we were blocked on the lock.
+    if _guard.is_some()
+        && let Some(p) = &cache_path
+        && let Ok(bytes) = std::fs::read(p)
+        && sha256_hex(&bytes) == d.hash
+    {
+        drop(_guard);
+        downloads.lock().unwrap().remove(&d.hash);
+        return Ok(bytes);
+    }
     eprintln!("[decryptd] downloading {}", d.filename);
 
     // Download straight into the cache path when we have a stable key (rsurl
@@ -253,6 +287,13 @@ fn fetch_blob(args: &RunArgs, d: &DataRef) -> Result<Vec<u8>> {
     } else {
         // We just added a finalized blob; keep the cache under its size cap.
         prune_cache(&cache, args.cache_max_gb.saturating_mul(1 << 30));
+    }
+    // Release the per-hash lock and drop its map entry (a later fetch of the same
+    // hash cache-hits, or re-creates the entry) so `downloads` only holds
+    // in-flight hashes.
+    drop(_guard);
+    if !d.hash.is_empty() {
+        downloads.lock().unwrap().remove(&d.hash);
     }
     Ok(bytes)
 }
@@ -414,6 +455,14 @@ struct FinishedJob {
 /// the submit is rejected.
 type InFlight = Arc<Mutex<HashMap<String, String>>>;
 
+/// Per-content-hash download locks, shared across every GPU's prefetch thread.
+/// Two GPUs claiming fragments of the same job fetch the same blobs; without
+/// coordination they'd race writing the same file in the shared cache. The first
+/// fetcher of a hash holds its lock and downloads; the rest block, then find the
+/// blob already cached. Entries are removed once the download finishes, so the
+/// map only ever holds in-flight hashes.
+type Downloads = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
+
 /// Shared worker state surfaced to the GUI tray: how many fragments are running
 /// on the GPU right now. Cheap atomics, threaded through the pipeline even in
 /// the headless build (the tray just never reads it there).
@@ -454,6 +503,7 @@ impl Drop for RunGuard {
 /// processing (in which case the caller should just back off and retry).
 fn claim_and_fetch(
     args: &RunArgs,
+    downloads: &Downloads,
     ctx: &RestContext,
     inflight: &InFlight,
 ) -> Result<Option<ReadyJob>> {
@@ -489,7 +539,7 @@ fn claim_and_fetch(
         let mut engine_zip: Option<Vec<u8>> = None;
         let mut data_blob: Option<(String, Vec<u8>)> = None;
         for d in &pull.job.data {
-            let bytes = fetch_blob(args, d)?;
+            let bytes = fetch_blob(args, downloads, d)?;
             if d.filename.ends_with(".zip") {
                 engine_zip = Some(bytes);
             } else {
@@ -600,13 +650,14 @@ fn decode_stream(dec: &mut dyn compcol::Decoder, input: &[u8]) -> Result<Vec<u8>
     Ok(out)
 }
 
-/// Run one ready fragment on the GPU. Creates its own CUDA context, so multiple of
-/// these can run concurrently (`--jobs > 1`).
-fn run_on_gpu(job: ReadyJob) -> Result<FinishedJob> {
-    let gpu = cuda::Gpu::load_first(&job.cubins).map_err(|e| anyhow!(e))?;
+/// Run one ready fragment on GPU `ordinal`. Creates its own CUDA context on the
+/// calling thread, so multiple of these run concurrently across `--jobs` runners
+/// and across GPUs.
+fn run_on_gpu(ordinal: i32, job: ReadyJob) -> Result<FinishedJob> {
+    let gpu = cuda::Gpu::load_first(ordinal, &job.cubins).map_err(|e| anyhow!(e))?;
     let (maj, min) = gpu.compute_capability();
     eprintln!(
-        "[decryptd] running [{}, {}) on {} (sm_{maj}{min}): entry={}",
+        "[decryptd] running [{}, {}) on GPU#{ordinal} {} (sm_{maj}{min}): entry={}",
         job.start,
         job.end,
         gpu.device_name(),
@@ -676,12 +727,13 @@ fn submit_job(ctx: &RestContext, response_key: &str, job: &FinishedJob) -> Resul
 /// waiting whenever the GPU frees up.
 fn prefetch_loop(
     args: Arc<RunArgs>,
+    downloads: Downloads,
     ctx: RestContext,
     inflight: InFlight,
     ready: SyncSender<ReadyJob>,
 ) {
     loop {
-        match claim_and_fetch(&args, &ctx, &inflight) {
+        match claim_and_fetch(&args, &downloads, &ctx, &inflight) {
             Ok(Some(job)) => {
                 if ready.send(job).is_err() {
                     return; // pipeline shut down
@@ -702,6 +754,7 @@ fn prefetch_loop(
 /// GPU stage: the serialized step. One per `--jobs`; each takes a ready job, runs it,
 /// and hands the result to the upload stage.
 fn run_loop(
+    ordinal: i32,
     args: Arc<RunArgs>,
     ready: Arc<Mutex<Receiver<ReadyJob>>>,
     inflight: InFlight,
@@ -716,7 +769,7 @@ fn run_loop(
         let frag_id = job.frag_id.clone();
         // Flip the tray status to "Running" for the duration of this GPU run.
         let _running = status.run_guard();
-        match run_on_gpu(job) {
+        match run_on_gpu(ordinal, job) {
             Ok(finished) => {
                 if done.send(finished).is_err() {
                     inflight.lock().unwrap().remove(&frag_id);
@@ -811,21 +864,53 @@ fn main() -> Result<()> {
     run_worker(args, status)
 }
 
+/// Resolve which GPU ordinals to run on: the `--gpus` list if given (validated
+/// against the detected count), otherwise every detected GPU.
+fn select_gpus(spec: &Option<String>, count: i32) -> Result<Vec<i32>> {
+    let Some(spec) = spec else {
+        return Ok((0..count).collect());
+    };
+    let mut ords = Vec::new();
+    for tok in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let ord: i32 = tok
+            .parse()
+            .map_err(|_| anyhow!("--gpus: '{tok}' is not a GPU ordinal"))?;
+        if ord < 0 || ord >= count {
+            bail!("--gpus: ordinal {ord} out of range (have {count} GPU(s): 0..{count})");
+        }
+        if !ords.contains(&ord) {
+            ords.push(ord);
+        }
+    }
+    if ords.is_empty() {
+        bail!("--gpus selected no GPUs");
+    }
+    Ok(ords)
+}
+
 fn run_worker(args: RunArgs, status: Status) -> Result<()> {
     std::fs::create_dir_all(&args.workdir)?;
     let ctx = RestContext::with_config(Config::new("https".to_string(), args.host.clone()))
         .with_debug(std::env::var("DECRYPTD_DEBUG").is_ok());
     let jobs = args.jobs.max(1);
-    eprintln!("[decryptd] host={} jobs={jobs}", args.host);
+
+    let count = cuda::device_count().map_err(|e| anyhow!("enumerating GPUs: {e}"))?;
+    if count < 1 {
+        bail!("no CUDA devices found");
+    }
+    let gpus = select_gpus(&args.gpus, count)?;
 
     let inflight: InFlight = Arc::new(Mutex::new(HashMap::new()));
+    let downloads: Downloads = Arc::new(Mutex::new(HashMap::new()));
 
     if args.once {
-        return match claim_and_fetch(&args, &ctx, &inflight)? {
+        // Single fragment on the first selected GPU.
+        let ord = gpus[0];
+        return match claim_and_fetch(&args, &downloads, &ctx, &inflight)? {
             Some(job) => {
                 let key = inflight.lock().unwrap().get(&job.frag_id).cloned();
                 let key = key.ok_or_else(|| anyhow!("fragment lost its response key"))?;
-                submit_job(&ctx, &key, &run_on_gpu(job)?)
+                submit_job(&ctx, &key, &run_on_gpu(ord, job)?)
             }
             None => {
                 eprintln!("[decryptd] no work; exiting (--once)");
@@ -834,36 +919,52 @@ fn run_worker(args: RunArgs, status: Status) -> Result<()> {
         };
     }
 
-    // Pipeline: prefetch → GPU run (×jobs) → upload (×jobs). The bounded channels keep
-    // at most `jobs` fragments waiting at each stage, so we don't over-claim work.
-    let (ready_tx, ready_rx) = sync_channel::<ReadyJob>(jobs);
-    let (done_tx, done_rx) = sync_channel::<FinishedJob>(jobs);
-    let ready_rx = Arc::new(Mutex::new(ready_rx));
-    let done_rx = Arc::new(Mutex::new(done_rx));
-    let args = Arc::new(args);
+    eprintln!(
+        "[decryptd] host={} GPUs={gpus:?} jobs={jobs}/GPU ({} runner(s) total)",
+        args.host,
+        gpus.len() * jobs
+    );
 
-    {
-        let (args, ctx, inflight) = (args.clone(), ctx.clone(), inflight.clone());
-        thread::spawn(move || prefetch_loop(args, ctx, inflight, ready_tx));
-    }
-    for _ in 0..jobs {
-        let (ctx, inflight, done_rx) = (ctx.clone(), inflight.clone(), done_rx.clone());
-        thread::spawn(move || upload_loop(ctx, inflight, done_rx));
-    }
+    let args = Arc::new(args);
     let mut runners = Vec::new();
-    for _ in 0..jobs {
-        let (args, ready_rx, inflight, done_tx) = (
-            args.clone(),
-            ready_rx.clone(),
-            inflight.clone(),
-            done_tx.clone(),
-        );
-        let status = status.clone();
-        runners.push(thread::spawn(move || {
-            run_loop(args, ready_rx, inflight, done_tx, status)
-        }));
+
+    // One independent pipeline per GPU: its own prefetch → bounded ready queue →
+    // `jobs` runners pinned to that GPU → `jobs` uploaders. Sharing `inflight`
+    // (dedupes a fragment the platform hands to two GPUs) and `downloads`
+    // (dedupes a blob two GPUs fetch into the shared cache).
+    for &ord in &gpus {
+        let (ready_tx, ready_rx) = sync_channel::<ReadyJob>(jobs);
+        let (done_tx, done_rx) = sync_channel::<FinishedJob>(jobs);
+        let ready_rx = Arc::new(Mutex::new(ready_rx));
+        let done_rx = Arc::new(Mutex::new(done_rx));
+
+        {
+            let (args, downloads, ctx, inflight) = (
+                args.clone(),
+                downloads.clone(),
+                ctx.clone(),
+                inflight.clone(),
+            );
+            thread::spawn(move || prefetch_loop(args, downloads, ctx, inflight, ready_tx));
+        }
+        for _ in 0..jobs {
+            let (ctx, inflight, done_rx) = (ctx.clone(), inflight.clone(), done_rx.clone());
+            thread::spawn(move || upload_loop(ctx, inflight, done_rx));
+        }
+        for _ in 0..jobs {
+            let (args, ready_rx, inflight, done_tx) = (
+                args.clone(),
+                ready_rx.clone(),
+                inflight.clone(),
+                done_tx.clone(),
+            );
+            let status = status.clone();
+            runners.push(thread::spawn(move || {
+                run_loop(ord, args, ready_rx, inflight, done_tx, status)
+            }));
+        }
+        drop(done_tx);
     }
-    drop(done_tx);
 
     // Runner threads loop forever; joining them blocks until the process is killed.
     for r in runners {
@@ -902,6 +1003,20 @@ mod tests {
         let bytes =
             decode_data_url("data:application/octet-stream;BASE64,aGVs\nbG8=").expect("decode");
         assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn select_gpus_defaults_and_validates() {
+        // Default: every detected GPU.
+        assert_eq!(select_gpus(&None, 3).unwrap(), vec![0, 1, 2]);
+        // Explicit list, order preserved, duplicates collapsed.
+        assert_eq!(select_gpus(&Some("2,0,2".into()), 4).unwrap(), vec![2, 0]);
+        // Whitespace tolerated.
+        assert_eq!(select_gpus(&Some(" 1 , 0 ".into()), 2).unwrap(), vec![1, 0]);
+        // Out of range and non-numeric are rejected.
+        assert!(select_gpus(&Some("3".into()), 2).is_err());
+        assert!(select_gpus(&Some("x".into()), 2).is_err());
+        assert!(select_gpus(&Some("".into()), 2).is_err());
     }
 
     #[test]

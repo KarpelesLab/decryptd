@@ -27,6 +27,7 @@ type CuDeviceptr = u64;
 #[allow(non_snake_case)]
 unsafe extern "C" {
     fn cuInit(flags: u32) -> CuResult;
+    fn cuDeviceGetCount(count: *mut i32) -> CuResult;
     fn cuDeviceGet(device: *mut CuDevice, ordinal: i32) -> CuResult;
     fn cuDeviceGetAttribute(pi: *mut i32, attrib: i32, dev: CuDevice) -> CuResult;
     fn cuDeviceGetName(name: *mut c_char, len: i32, dev: CuDevice) -> CuResult;
@@ -119,6 +120,16 @@ impl Drop for DeviceBuf {
     }
 }
 
+/// Number of CUDA devices visible to the driver (after `CUDA_VISIBLE_DEVICES`).
+pub fn device_count() -> Result<i32, String> {
+    unsafe {
+        check(cuInit(0), "cuInit")?;
+        let mut n: i32 = 0;
+        check(cuDeviceGetCount(&mut n), "cuDeviceGetCount")?;
+        Ok(n)
+    }
+}
+
 /// An initialized CUDA context with a module loaded.
 pub struct Gpu {
     ctx: CuContext,
@@ -127,8 +138,10 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    /// Init device 0 and load the best cubin for it. Callers pass `(arch, bytes)`
-    /// pairs highest-arch-first, where arch is CC `X.Y` encoded as `X*10+Y`.
+    /// Init device `ordinal` and load the best cubin for it. Callers pass
+    /// `(arch, bytes)` pairs highest-arch-first, where arch is CC `X.Y` encoded as
+    /// `X*10+Y`. The created context is current on the *calling thread*, so each
+    /// runner thread must call this on its own GPU (see [`crate::run_loop`]).
     ///
     /// Cubins newer than the device are skipped rather than tried: an old driver
     /// (e.g. 550.x / CUDA 12.4) doesn't cleanly reject a cubin for an architecture
@@ -136,11 +149,11 @@ impl Gpu {
     /// libcuda. So we query the GPU's compute capability first and never hand the
     /// driver anything above it. Same-major-lower cubins that still don't load
     /// (a known arch the driver rejects) fall through to the next candidate.
-    pub fn load_first(cubins: &[(u32, Vec<u8>)]) -> Result<Gpu, String> {
+    pub fn load_first(ordinal: i32, cubins: &[(u32, Vec<u8>)]) -> Result<Gpu, String> {
         unsafe {
             check(cuInit(0), "cuInit")?;
             let mut dev: CuDevice = 0;
-            check(cuDeviceGet(&mut dev, 0), "cuDeviceGet")?;
+            check(cuDeviceGet(&mut dev, ordinal), "cuDeviceGet")?;
 
             // Device compute capability, encoded to match the `smNN` tags.
             let (mut maj, mut min) = (0i32, 0i32);
@@ -359,7 +372,7 @@ mod tests {
         // it; the real cubin must still match this GPU for cuModuleLoadData.
         let cubins = vec![(0u32, bytes)];
         for i in 0..64 {
-            let gpu = Gpu::load_first(&cubins)
+            let gpu = Gpu::load_first(0, &cubins)
                 .unwrap_or_else(|e| panic!("iteration {i}: load_first failed: {e}"));
             // Touch it so the context is really used, then drop at end of scope.
             let _ = gpu.compute_capability();
