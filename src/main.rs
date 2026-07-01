@@ -56,9 +56,11 @@ struct RunArgs {
     /// KarpelesLab platform host (pullOne/submitFragment are anonymous — no key needed).
     #[arg(long, env = "DECRYPTD_HOST", default_value = "www.atonline.com")]
     host: String,
-    /// Working directory for the blob cache and scratch.
-    #[arg(long, env = "DECRYPTD_WORKDIR", default_value = "decryptd-data")]
-    workdir: PathBuf,
+    /// Working directory for the blob cache, worker id, and scratch. Defaults to a
+    /// per-user data dir for the GUI build (it may be launched from a non-writable
+    /// CWD like System32) and to `./decryptd-data` for the console build.
+    #[arg(long, env = "DECRYPTD_WORKDIR")]
+    workdir: Option<PathBuf>,
     /// Claim a single fragment then exit (default: loop forever).
     #[arg(long)]
     once: bool,
@@ -79,6 +81,39 @@ struct RunArgs {
     /// so the only cost of dropping a file is a re-download on a later cache miss.
     #[arg(long, default_value_t = 20)]
     cache_max_gb: u64,
+}
+
+impl RunArgs {
+    /// The resolved working directory: the `--workdir`/`DECRYPTD_WORKDIR` value if
+    /// given, else [`default_workdir`].
+    fn workdir(&self) -> PathBuf {
+        self.workdir.clone().unwrap_or_else(default_workdir)
+    }
+}
+
+/// Default working directory. The GUI build can be started from any CWD (an
+/// Explorer double-click, a login item, a service), and a CWD-relative folder may
+/// not be creatable there — a silent failure that strands the tray on "Waiting".
+/// So the GUI build defaults to a stable per-user data dir; the console build,
+/// run from an operator-chosen directory, keeps `./decryptd-data`.
+fn default_workdir() -> PathBuf {
+    #[cfg(feature = "gui")]
+    {
+        #[cfg(windows)]
+        if let Some(base) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(base).join("decryptd");
+        }
+        #[cfg(not(windows))]
+        {
+            if let Some(base) = std::env::var_os("XDG_DATA_HOME") {
+                return PathBuf::from(base).join("decryptd");
+            }
+            if let Some(home) = std::env::var_os("HOME") {
+                return PathBuf::from(home).join(".local/share/decryptd");
+            }
+        }
+    }
+    PathBuf::from("decryptd-data")
 }
 
 // ------------------------------------------------------------- pullOne response
@@ -228,7 +263,7 @@ fn fetch_blob(args: &RunArgs, downloads: &Downloads, d: &DataRef) -> Result<Vec<
         return Ok(bytes);
     }
 
-    let cache = args.workdir.join("cache");
+    let cache = args.workdir().join("cache");
     std::fs::create_dir_all(&cache)?;
     // `Hash` is the blob's content SHA-256, so it doubles as a cache key + checksum.
     let cache_path = (!d.hash.is_empty()).then(|| cache.join(&d.hash));
@@ -473,6 +508,10 @@ struct Status {
     active: Arc<AtomicUsize>,
     /// Set by the tray's Pause item; the worker parks at its gates while true.
     paused: Arc<AtomicBool>,
+    /// Why the worker is idle when not running — "no open work", a pull error, or
+    /// a fatal stop. Surfaced in the tray so a Windows user (whose console logs are
+    /// swallowed by the GUI subsystem) can tell an idle worker from a broken one.
+    note: Arc<Mutex<String>>,
 }
 
 impl Status {
@@ -511,6 +550,21 @@ impl Status {
         while self.paused.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(200));
         }
+    }
+
+    /// Record why the worker is idle (shown in the tray). Set by the pipeline on
+    /// pull errors / no-work and by the GUI on a fatal worker stop.
+    fn set_note(&self, note: impl Into<String>) {
+        *self.note.lock().unwrap() = note.into();
+    }
+
+    /// The current idle note, or empty. Only read by the GUI tray.
+    #[cfg_attr(
+        not(all(feature = "gui", any(target_os = "linux", target_os = "windows"))),
+        allow(dead_code)
+    )]
+    fn note(&self) -> String {
+        self.note.lock().unwrap().clone()
     }
 
     /// Mark a GPU run as started; the returned guard marks it finished on drop
@@ -777,16 +831,19 @@ fn prefetch_loop(
         status.wait_while_paused();
         match claim_and_fetch(&args, &downloads, &worker_id, &ctx, &inflight) {
             Ok(Some(job)) => {
+                status.set_note(""); // got work; clear any idle note
                 if ready.send(job).is_err() {
                     return; // pipeline shut down
                 }
             }
             Ok(None) => {
                 eprintln!("[decryptd] no work; sleeping {}s", args.idle_secs);
+                status.set_note("no open work");
                 thread::sleep(Duration::from_secs(args.idle_secs));
             }
             Err(e) => {
                 eprintln!("[decryptd] pull error: {e:#}");
+                status.set_note(format!("pull error: {e}"));
                 thread::sleep(Duration::from_secs(args.idle_secs));
             }
         }
@@ -952,11 +1009,13 @@ fn load_or_create_worker_id(workdir: &Path) -> Result<String> {
 }
 
 fn run_worker(args: RunArgs, status: Status) -> Result<()> {
-    std::fs::create_dir_all(&args.workdir)?;
+    let workdir = args.workdir();
+    std::fs::create_dir_all(&workdir)
+        .with_context(|| format!("creating workdir {}", workdir.display()))?;
     let ctx = RestContext::with_config(Config::new("https".to_string(), args.host.clone()))
         .with_debug(std::env::var("DECRYPTD_DEBUG").is_ok());
     let jobs = args.jobs.max(1);
-    let worker_id = load_or_create_worker_id(&args.workdir)?;
+    let worker_id = load_or_create_worker_id(&workdir)?;
 
     let count = cuda::device_count().map_err(|e| anyhow!("enumerating GPUs: {e}"))?;
     if count < 1 {
@@ -1071,6 +1130,17 @@ mod tests {
         let bytes =
             decode_data_url("data:application/octet-stream;BASE64,aGVs\nbG8=").expect("decode");
         assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn workdir_override_beats_default() {
+        // Explicit --workdir is always honored verbatim.
+        let a = RunArgs::parse_from(["decryptd", "--workdir", "/tmp/custom-wd"]);
+        assert_eq!(a.workdir(), PathBuf::from("/tmp/custom-wd"));
+        // In the (non-gui) test build the default is the CWD-relative folder.
+        let b = RunArgs::parse_from(["decryptd"]);
+        assert_eq!(b.workdir(), default_workdir());
+        assert_eq!(default_workdir(), PathBuf::from("decryptd-data"));
     }
 
     #[test]

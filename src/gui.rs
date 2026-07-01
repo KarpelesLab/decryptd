@@ -31,8 +31,13 @@ pub fn run_with_tray(args: RunArgs, status: Status) -> Result<()> {
 
     let worker_status = status.clone();
     let worker = std::thread::spawn(move || {
-        if let Err(e) = crate::run_worker(args, worker_status) {
-            eprintln!("[decryptd] worker error: {e:#}");
+        if let Err(e) = crate::run_worker(args, worker_status.clone()) {
+            let msg = format!("{e:#}");
+            eprintln!("[decryptd] worker error: {msg}");
+            // The GUI subsystem swallows stderr, so make a fatal stop visible:
+            // record it in the tray status and pop a desktop notification.
+            worker_status.set_note(format!("stopped: {msg}"));
+            notify_error(&msg);
         }
     });
 
@@ -74,15 +79,26 @@ fn load_icon() -> Result<Icon> {
 }
 
 /// The status line, refreshed each tick. Paused wins over running: while a paused
-/// fragment sits parked between tiles it still counts as "active".
-fn status_label(status: &Status) -> &'static str {
+/// fragment sits parked between tiles it still counts as "active". When idle, the
+/// worker's note (why it's waiting) is shown so a silent stall is legible.
+fn status_label(status: &Status) -> String {
     if status.is_paused() {
-        "Status: Paused"
-    } else if status.is_running() {
-        "Status: Running"
-    } else {
-        "Status: Waiting"
+        return "Status: Paused".to_string();
     }
+    if status.is_running() {
+        return "Status: Running".to_string();
+    }
+    let note = status.note();
+    if note.is_empty() {
+        return "Status: Waiting".to_string();
+    }
+    // Keep the menu from ballooning on a long error message.
+    let note = if note.chars().count() > 60 {
+        format!("{}…", note.chars().take(60).collect::<String>())
+    } else {
+        note
+    };
+    format!("Status: {note}")
 }
 
 /// The Pause/Resume toggle's label, refreshed each tick to match the flag.
@@ -156,6 +172,16 @@ fn notify_running() {
     if let Err(e) = res {
         eprintln!("[decryptd] launch notification unavailable: {e}");
     }
+}
+
+/// Pop a desktop notification for a fatal worker stop. The GUI subsystem has no
+/// console, so this is the only way such an error reaches the user (the tray
+/// status line also carries it, but a notification is what draws the eye).
+fn notify_error(msg: &str) {
+    let _ = notify_rust::Notification::new()
+        .summary(&format!("decryptd v{VERSION} stopped"))
+        .body(msg)
+        .show();
 }
 
 /// Kick off a one-shot self-update from the tray. Reuses [`crate::build_updater`]
