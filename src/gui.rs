@@ -184,20 +184,42 @@ fn notify_error(msg: &str) {
         .show();
 }
 
-/// Kick off a one-shot self-update from the tray. Reuses [`crate::build_updater`]
-/// — the same signed updater the hourly background task uses — so it shares the
-/// trust anchor and transport; `update()` fetches the latest signed manifest,
-/// installs it if it's a genuinely newer build, and re-execs into it. Runs on
-/// its own thread so a slow network never freezes the menu, and is a no-op (bar
-/// a log line) when we're already current.
+/// Desktop notification about an update-check outcome.
+fn notify_update(body: &str) {
+    let _ = notify_rust::Notification::new()
+        .summary(&format!("decryptd v{VERSION} — updates"))
+        .body(body)
+        .show();
+}
+
+/// Run a one-shot self-update from the tray, reporting the outcome via desktop
+/// notification. This is the ONLY feedback on the Windows GUI build (no console),
+/// so "Check for Updates" must never fail silently: the user always sees
+/// up-to-date, installing, or the actual error. Reuses [`crate::build_updater`]
+/// (same signed updater the hourly task uses); runs on its own thread so a slow
+/// network never freezes the menu.
 fn trigger_update_check() {
-    std::thread::spawn(|| match crate::build_updater() {
-        Ok(updater) => match updater.update() {
-            Ok(true) => {} // installed; the process is being replaced
-            Ok(false) => eprintln!("[decryptd] already up to date"),
-            Err(e) => eprintln!("[decryptd] update check failed: {e}"),
-        },
-        Err(e) => eprintln!("[decryptd] updater unavailable: {e}"),
+    std::thread::spawn(|| {
+        let updater = match crate::build_updater() {
+            Ok(u) => u,
+            Err(e) => {
+                notify_update(&format!("Updater unavailable: {e}"));
+                return;
+            }
+        };
+        // Check first so we can name the target version and surface a fetch/verify
+        // error, then hand off to update() (re-checks, installs, and restarts).
+        match updater.check() {
+            Ok(Some(available)) => {
+                let v = available.version().to_string();
+                notify_update(&format!("Updating to v{v} — decryptd will restart."));
+                if let Err(e) = updater.update() {
+                    notify_update(&format!("Update to v{v} failed: {e}"));
+                }
+            }
+            Ok(None) => notify_update(&format!("decryptd is up to date (v{VERSION}).")),
+            Err(e) => notify_update(&format!("Update check failed: {e}")),
+        }
     });
 }
 

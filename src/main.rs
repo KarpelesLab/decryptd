@@ -924,23 +924,25 @@ fn upload_loop(ctx: RestContext, inflight: InFlight, done: Arc<Mutex<Receiver<Fi
 /// private identity.
 const RSUPD_FINGERPRINT: &str = "80b9edc7e6eaebf10b2a25bb10556b9b7fa6abc9fbe556706a2b680cefa4a0fc";
 
-/// The update channel this build tracks. The GUI build follows `master` (rsupd's
-/// default); the headless build follows `server`, a separate channel carrying the
-/// no-GUI binary, so a console worker updates to another console build rather than
-/// the GTK-linked GUI one. CI publishes each channel from its own binary.
+/// The rsupd project this build updates from. The dist backend keys releases by
+/// (project, version), so the GUI and headless builds — same version, same
+/// os_arch, different binary — must live under different projects, not just
+/// different channels. The GUI build is `decryptd`; the headless build is
+/// `decryptd-server`, published from the no-GUI binary. Both are signed by the
+/// same identity/fingerprint. A console worker thus updates to another console
+/// build, never the GTK-linked GUI one (which wouldn't start on a headless box).
 #[cfg(feature = "gui")]
-const UPDATE_CHANNEL: &str = "master";
+const UPDATE_PROJECT: &str = "decryptd";
 #[cfg(not(feature = "gui"))]
-const UPDATE_CHANNEL: &str = "server";
+const UPDATE_PROJECT: &str = "decryptd-server";
 
 /// Build the signed auto-updater. The transport (dist-go over rsurl) defaults from
-/// the fingerprint, so the anchor + channel are the only required inputs. The git
+/// the fingerprint, so the anchor + project are the only required inputs. The git
 /// stamps from `build.rs` let it also spot a newer build of the same version (and
 /// never reinstall the identical build).
 fn build_updater() -> rsupd::Result<rsupd::Updater> {
-    rsupd::Updater::builder(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+    rsupd::Updater::builder(UPDATE_PROJECT, env!("CARGO_PKG_VERSION"))
         .fingerprint_hex(RSUPD_FINGERPRINT)
-        .channel(UPDATE_CHANNEL)
         .git_tag(env!("RSUPD_GIT_TAG"))
         .date_tag(rsupd::date_tag_from_unix(env!("RSUPD_BUILD_UNIX")))
         .build()

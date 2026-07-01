@@ -57,11 +57,13 @@ jobs:
           RSUPD_IDENTITY: ${{ secrets.RSUPD_IDENTITY }}
         run: rsupd publish --ci --run ${{ github.run_id }} --channel master --yes
 
-  # The headless -server build tracks its own `server` channel so console workers
-  # auto-update to another console build, never the GTK-linked GUI binary on
-  # `master`. Its binary isn't a triple-named CI artifact, so `--ci` can't stage it;
-  # instead we drop it into target/<triple>/release/ and publish in local mode
-  # (rsupd packages the existing binary — no recompile).
+  # The headless -server build updates from its own rsupd project `decryptd-server`
+  # (the backend keys releases by project+version, so the GUI and server binaries —
+  # same version, same os_arch — can't share the `decryptd` project). Its binary
+  # isn't a triple-named CI artifact, so `--ci` can't stage it; instead we drop it
+  # into target/<triple>/release/ and publish in local mode with an explicit
+  # --project (rsupd packages the existing binary — no recompile). Independent of
+  # the master publish, so a failure here never blocks GUI updates.
   publish-server:
     name: Sign & publish server update
     needs: build
@@ -83,7 +85,7 @@ jobs:
           mkdir -p target/x86_64-unknown-linux-gnu/release
           tar -xzf srv/decryptd-linux-x86_64-server.tar.gz \
             -C target/x86_64-unknown-linux-gnu/release decryptd
-      - name: Sign & publish to the `server` channel
+      - name: Sign & publish the decryptd-server project
         env:
           RSUPD_IDENTITY: ${{ secrets.RSUPD_IDENTITY }}
-        run: rsupd publish --target x86_64-unknown-linux-gnu --channel server --yes
+        run: rsupd publish --project decryptd-server --target x86_64-unknown-linux-gnu --channel master --yes
