@@ -90,3 +90,41 @@ jobs:
           name: ${{ matrix.target }}
           path: target/release/${{ matrix.bin }}
           if-no-files-found: error
+
+  # Headless console build for servers: no GUI/tray, and — by design — no
+  # auto-updater (the `master` update channel carries the GTK-linked GUI binary,
+  # which won't start on a headless box). Shipped as a download-only release asset;
+  # operators upgrade by re-downloading. Only the .tar.gz is uploaded (no
+  # triple-named raw binary), so `rsupd publish --ci` never stages it into the
+  # signed update package.
+  build-server:
+    name: linux-x86_64-server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # build.rs links libcuda regardless of the GUI feature, so the CUDA toolkit
+      # is still needed to resolve the driver symbols at link time.
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda
+        with:
+          cuda: "12.6.0"
+
+      - name: Build (console, no GUI)
+        run: cargo build --release --locked
+
+      - name: Package (→ tar.gz)
+        run: |
+          mkdir -p dist
+          tar -czf "dist/decryptd-linux-x86_64-server.tar.gz" -C target/release decryptd
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: decryptd-linux-x86_64-server.tar.gz
+          path: dist/decryptd-linux-x86_64-server.tar.gz
+          if-no-files-found: error

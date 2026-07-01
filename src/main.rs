@@ -921,13 +921,15 @@ fn upload_loop(ctx: RestContext, inflight: InFlight, done: Arc<Mutex<Receiver<Fi
 /// Trust anchor for self-updates: the SHA-256 fingerprint of the decryptd
 /// release signing key (`rsupd id export`). It's a hash of a public key, so it's
 /// safe to embed; the updater refuses any manifest not signed by the matching
-/// private identity.
+/// private identity. GUI-build only — the console `-server` build has no updater.
+#[cfg(feature = "gui")]
 const RSUPD_FINGERPRINT: &str = "80b9edc7e6eaebf10b2a25bb10556b9b7fa6abc9fbe556706a2b680cefa4a0fc";
 
 /// Build the signed auto-updater. The transport (dist-go over rsurl) and channel
 /// (`master`) default from the fingerprint, so the anchor is the only required
 /// input. The git stamps from `build.rs` let it also spot a newer build of the
-/// same version (and never reinstall the identical build).
+/// same version (and never reinstall the identical build). GUI-build only.
+#[cfg(feature = "gui")]
 fn build_updater() -> rsupd::Result<rsupd::Updater> {
     rsupd::Updater::builder(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
         .fingerprint_hex(RSUPD_FINGERPRINT)
@@ -943,9 +945,13 @@ fn main() -> Result<()> {
     let args = RunArgs::parse();
     let status = Status::default();
 
-    // Long-lived workers keep themselves current: check hourly in the background
-    // and restart into each new signed build. `--once` is short-lived, so it
-    // skips the updater.
+    // Self-update is a GUI-build feature only. The headless `-server` build ships
+    // without it (operators update by re-downloading) — the master update channel
+    // carries the GTK-linked GUI binary, which wouldn't even start on a server, so
+    // a console build must never pull from it. Long-lived GUI workers keep
+    // themselves current: check hourly in the background and restart into each new
+    // signed build. `--once` is short-lived, so it skips the updater.
+    #[cfg(feature = "gui")]
     if !args.once {
         match build_updater() {
             Ok(updater) => {
