@@ -531,7 +531,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "decryptd"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1716,9 +1716,9 @@ dependencies = [
 
 [[package]]
 name = "rsurl"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08b41e412fc29c8328a4370832e7303f33ef64eeaf62565d453c47c0895ef5af"
+checksum = "88bf185ba6ce57280a11a8859fbda56defeed5cd4b054510d084419c2dc2d77b"
 dependencies = [
  "compcol 0.6.6",
  "intl 0.4.1",

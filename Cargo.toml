@@ -1,6 +1,6 @@
 [package]
 name = "decryptd"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2024"
 license = "Proprietary"
 authors = ["Karpeles Lab Inc"]
@@ -30,8 +30,11 @@ serde_json = "1"
 uuid = { version = "1", features = ["v7"] }
 purecrypto = { version = "0.6.7", features = ["hazmat-secp256k1"] }
 # Pinned to the same major as klbfw's rsurl (0.1) — two rsurl versions in one binary
-# collide on its C FFI symbols (duplicate-symbol link error).
-rsurl = { version = "0.1.4", features = ["json"] }
+# collide on its C FFI symbols (duplicate-symbol link error). 0.1.5 fixes TLS on
+# Windows: earlier versions read CA roots only from Unix file paths, so every HTTPS
+# call failed with "bad response" (no console → invisible) — breaking pullOne and
+# self-update. 0.1.5 falls back to the embedded `cacrt` root bundle.
+rsurl = { version = "0.1.5", features = ["json"] }
 # In-house compression collection: xz for the result (out); the data blob (in)
 # is auto-detected via `factory::detect`, so enable the `factory` runtime
 # decoder lookup plus the container formats we can actually decode.
