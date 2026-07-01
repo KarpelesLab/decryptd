@@ -48,7 +48,7 @@ pub fn run_with_tray(args: RunArgs, status: Status) -> Result<()> {
     Ok(())
 }
 
-/// The GPUs decryptd will use, as menu-ready labels ("GPU#0: <name>"). Mirrors the
+/// The GPUs decryptd will use, as menu-ready labels (`GPU#0: <name>`). Mirrors the
 /// worker's own selection (`--gpus`, else all detected) so the tray shows exactly
 /// what's in play. Best-effort: any probe failure collapses to a single note.
 fn gpu_labels(args: &RunArgs) -> Vec<String> {
