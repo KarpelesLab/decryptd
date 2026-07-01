@@ -36,7 +36,7 @@ mod gui;
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -470,6 +470,8 @@ type Downloads = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 struct Status {
     /// Count of fragments currently executing on the GPU (0 = waiting for work).
     active: Arc<AtomicUsize>,
+    /// Set by the tray's Pause item; the worker parks at its gates while true.
+    paused: Arc<AtomicBool>,
 }
 
 impl Status {
@@ -481,6 +483,33 @@ impl Status {
     )]
     fn is_running(&self) -> bool {
         self.active.load(Ordering::Relaxed) > 0
+    }
+
+    /// Whether the tray has paused processing. Only read by the GUI tray.
+    #[cfg_attr(
+        not(all(feature = "gui", any(target_os = "linux", target_os = "windows"))),
+        allow(dead_code)
+    )]
+    fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    /// Set/clear the pause flag. Only called by the GUI tray.
+    #[cfg_attr(
+        not(all(feature = "gui", any(target_os = "linux", target_os = "windows"))),
+        allow(dead_code)
+    )]
+    fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+    }
+
+    /// Park the calling worker thread while paused (polled). Compiled into every
+    /// build but only ever blocks when the tray flips the flag — the headless
+    /// worker never pauses. Cheap: a relaxed load every 200 ms while idle.
+    fn wait_while_paused(&self) {
+        while self.paused.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(200));
+        }
     }
 
     /// Mark a GPU run as started; the returned guard marks it finished on drop
@@ -653,7 +682,7 @@ fn decode_stream(dec: &mut dyn compcol::Decoder, input: &[u8]) -> Result<Vec<u8>
 /// Run one ready fragment on GPU `ordinal`. Creates its own CUDA context on the
 /// calling thread, so multiple of these run concurrently across `--jobs` runners
 /// and across GPUs.
-fn run_on_gpu(ordinal: i32, job: ReadyJob) -> Result<FinishedJob> {
+fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJob> {
     let gpu = cuda::Gpu::load_first(ordinal, &job.cubins).map_err(|e| anyhow!(e))?;
     let (maj, min) = gpu.compute_capability();
     eprintln!(
@@ -675,6 +704,9 @@ fn run_on_gpu(ordinal: i32, job: ReadyJob) -> Result<FinishedJob> {
         job.manifest.block,
         job.manifest.tile,
         |_done, _total| {},
+        // Between tiles, park here while paused so the GPU stops computing
+        // promptly and the current fragment resumes losslessly.
+        || status.wait_while_paused(),
     )
     .map_err(|e| anyhow!("run_job: {e}"))?;
     let run_secs = t0.elapsed().as_secs_f64();
@@ -731,8 +763,11 @@ fn prefetch_loop(
     ctx: RestContext,
     inflight: InFlight,
     ready: SyncSender<ReadyJob>,
+    status: Status,
 ) {
     loop {
+        // Don't claim new work while paused.
+        status.wait_while_paused();
         match claim_and_fetch(&args, &downloads, &ctx, &inflight) {
             Ok(Some(job)) => {
                 if ready.send(job).is_err() {
@@ -766,10 +801,12 @@ fn run_loop(
             Ok(job) => job,
             Err(_) => return, // prefetcher gone
         };
+        // Don't start a new fragment (or even load the GPU) while paused.
+        status.wait_while_paused();
         let frag_id = job.frag_id.clone();
         // Flip the tray status to "Running" for the duration of this GPU run.
         let _running = status.run_guard();
-        match run_on_gpu(ordinal, job) {
+        match run_on_gpu(ordinal, job, &status) {
             Ok(finished) => {
                 if done.send(finished).is_err() {
                     inflight.lock().unwrap().remove(&frag_id);
@@ -910,7 +947,7 @@ fn run_worker(args: RunArgs, status: Status) -> Result<()> {
             Some(job) => {
                 let key = inflight.lock().unwrap().get(&job.frag_id).cloned();
                 let key = key.ok_or_else(|| anyhow!("fragment lost its response key"))?;
-                submit_job(&ctx, &key, &run_on_gpu(ord, job)?)
+                submit_job(&ctx, &key, &run_on_gpu(ord, job, &status)?)
             }
             None => {
                 eprintln!("[decryptd] no work; exiting (--once)");
@@ -939,13 +976,14 @@ fn run_worker(args: RunArgs, status: Status) -> Result<()> {
         let done_rx = Arc::new(Mutex::new(done_rx));
 
         {
-            let (args, downloads, ctx, inflight) = (
+            let (args, downloads, ctx, inflight, status) = (
                 args.clone(),
                 downloads.clone(),
                 ctx.clone(),
                 inflight.clone(),
+                status.clone(),
             );
-            thread::spawn(move || prefetch_loop(args, downloads, ctx, inflight, ready_tx));
+            thread::spawn(move || prefetch_loop(args, downloads, ctx, inflight, ready_tx, status));
         }
         for _ in 0..jobs {
             let (ctx, inflight, done_rx) = (ctx.clone(), inflight.clone(), done_rx.clone());
@@ -1003,6 +1041,31 @@ mod tests {
         let bytes =
             decode_data_url("data:application/octet-stream;BASE64,aGVs\nbG8=").expect("decode");
         assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn pause_gate_blocks_until_resumed() {
+        let status = Status::default();
+        assert!(!status.is_paused());
+        // Not paused: the gate returns immediately.
+        status.wait_while_paused();
+
+        status.set_paused(true);
+        assert!(status.is_paused());
+        let resumer = status.clone();
+        let t = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            resumer.set_paused(false);
+        });
+        let t0 = Instant::now();
+        status.wait_while_paused(); // blocks until the resumer clears the flag
+        let waited = t0.elapsed();
+        t.join().unwrap();
+        assert!(!status.is_paused());
+        assert!(
+            waited >= Duration::from_millis(100),
+            "gate returned before resume: {waited:?}"
+        );
     }
 
     #[test]

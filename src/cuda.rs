@@ -130,6 +130,25 @@ pub fn device_count() -> Result<i32, String> {
     }
 }
 
+/// Human-readable name of device `ordinal`, queried without creating a context
+/// (so the tray can list GPUs cheaply). `cfg`-gated to the GUI build's callers.
+#[cfg(all(feature = "gui", any(target_os = "linux", target_os = "windows")))]
+pub fn device_name(ordinal: i32) -> Result<String, String> {
+    unsafe {
+        check(cuInit(0), "cuInit")?;
+        let mut dev: CuDevice = 0;
+        check(cuDeviceGet(&mut dev, ordinal), "cuDeviceGet")?;
+        let mut buf = [0i8; 128];
+        check(
+            cuDeviceGetName(buf.as_mut_ptr() as *mut c_char, 128, dev),
+            "cuDeviceGetName",
+        )?;
+        Ok(CStr::from_ptr(buf.as_ptr() as *const c_char)
+            .to_string_lossy()
+            .into_owned())
+    }
+}
+
 /// An initialized CUDA context with a module loaded.
 pub struct Gpu {
     ctx: CuContext,
@@ -237,7 +256,9 @@ impl Drop for Gpu {
 /// Run the generic kernel `entry` over `[start, end]` (inclusive), tiling by `tile`
 /// items per launch. `data` is the opaque job blob (uploaded once). Returns the raw
 /// output records (`out_count * record_size` bytes, concatenated across tiles), and
-/// reports per-tile progress via `progress(done, total)`.
+/// reports per-tile progress via `progress(done, total)`. `gate` is called before
+/// each tile launch: it blocks while the worker is paused, so a long fragment stops
+/// computing promptly and resumes on the next tile without losing progress.
 #[allow(clippy::too_many_arguments)]
 pub fn run_job(
     gpu: &Gpu,
@@ -250,6 +271,7 @@ pub fn run_job(
     block: u32,
     tile: u64,
     mut progress: impl FnMut(u64, u64),
+    gate: impl Fn(),
 ) -> Result<Vec<u8>, String> {
     // Validate the publisher-supplied launch params up front: a bad manifest is a
     // handled error, never a panic (a panic here unwinds the runner thread and
@@ -273,6 +295,7 @@ pub fn run_job(
     let mut done = 0u64;
     let mut cur = start;
     while cur <= end_incl {
+        gate(); // park here while paused (no kernel launched until resumed)
         let count = ((end_incl - cur).saturating_add(1)).min(tile);
         d_count.memset0()?;
         let (mut a_start, mut a_count) = (cur, count);
