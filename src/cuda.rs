@@ -238,6 +238,17 @@ pub fn run_job(
     tile: u64,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<Vec<u8>, String> {
+    // Validate the publisher-supplied launch params up front: a bad manifest is a
+    // handled error, never a panic (a panic here unwinds the runner thread and
+    // takes the whole daemon down). `block == 0` would divide-by-zero below;
+    // `record_size == 0` makes the output layout meaningless.
+    if block == 0 {
+        return Err("manifest block size is 0".into());
+    }
+    if record_size == 0 {
+        return Err("manifest record_size is 0".into());
+    }
+
     let func = gpu.function(entry)?;
     let d_data = DeviceBuf::from_slice(data)?;
     let d_out = DeviceBuf::alloc(record_size as usize * out_cap as usize)?;
@@ -263,7 +274,12 @@ pub fn run_job(
             &mut a_oc as *mut _ as *mut c_void,
             &mut a_cap as *mut _ as *mut c_void,
         ];
-        let grid = count.div_ceil(block as u64) as u32;
+        // A too-large tile relative to block can overflow the u32 grid dimension;
+        // reject it rather than silently truncating (which would under-compute).
+        let grid_u64 = count.div_ceil(block as u64);
+        let grid = u32::try_from(grid_u64).map_err(|_| {
+            format!("grid {grid_u64} exceeds u32 (tile too large for block {block})")
+        })?;
         check(
             unsafe {
                 cuLaunchKernel(

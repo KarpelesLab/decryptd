@@ -33,7 +33,7 @@ mod gui;
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -66,6 +66,11 @@ struct RunArgs {
     /// the next job and upload of finished results always overlap the GPU run.
     #[arg(long, default_value_t = 1)]
     jobs: usize,
+    /// Maximum on-disk blob cache size, in GB. Once exceeded, the oldest cached
+    /// blobs are evicted. Eviction is safe: a running job holds its blob in memory,
+    /// so the only cost of dropping a file is a re-download on a later cache miss.
+    #[arg(long, default_value_t = 20)]
+    cache_max_gb: u64,
 }
 
 // ------------------------------------------------------------- pullOne response
@@ -245,8 +250,51 @@ fn fetch_blob(args: &RunArgs, d: &DataRef) -> Result<Vec<u8>> {
     let bytes = std::fs::read(&target)?;
     if is_temp {
         let _ = std::fs::remove_file(&target);
+    } else {
+        // We just added a finalized blob; keep the cache under its size cap.
+        prune_cache(&cache, args.cache_max_gb.saturating_mul(1 << 30));
     }
     Ok(bytes)
+}
+
+/// Keep the blob cache under `max_bytes` by evicting the oldest finalized entries
+/// (by mtime). Best-effort — any IO error just leaves that file in place. Skips
+/// rsurl's in-progress `.part`/`.tmp` files so an active download is never
+/// disturbed; everything else is fair game, since `fetch_blob` reads each blob
+/// fully into memory and no running job depends on its file surviving.
+fn prune_cache(cache: &Path, max_bytes: u64) {
+    let Ok(rd) = std::fs::read_dir(cache) else {
+        return;
+    };
+    let mut entries: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+    let mut total: u64 = 0;
+    for e in rd.flatten() {
+        let path = e.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.ends_with(".part") || name.ends_with(".tmp") {
+            continue; // an in-progress download rsurl still owns
+        }
+        let Ok(meta) = e.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        total = total.saturating_add(meta.len());
+        entries.push((mtime, meta.len(), path));
+    }
+    if total <= max_bytes {
+        return;
+    }
+    entries.sort_by_key(|(mtime, _, _)| *mtime); // oldest first
+    for (_, len, path) in entries {
+        if total <= max_bytes {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(len);
+            eprintln!("[decryptd] cache: evicted {} ({len} B)", path.display());
+        }
+    }
 }
 
 /// Decode an RFC 2397 `data:` URI into its raw bytes. Handles the two payload
@@ -654,6 +702,7 @@ fn prefetch_loop(
 /// GPU stage: the serialized step. One per `--jobs`; each takes a ready job, runs it,
 /// and hands the result to the upload stage.
 fn run_loop(
+    args: Arc<RunArgs>,
     ready: Arc<Mutex<Receiver<ReadyJob>>>,
     inflight: InFlight,
     done: SyncSender<FinishedJob>,
@@ -677,6 +726,11 @@ fn run_loop(
             Err(e) => {
                 eprintln!("[decryptd] run error: {e:#}");
                 inflight.lock().unwrap().remove(&frag_id);
+                // Back off before taking the next fragment. Without this a
+                // persistent GPU fault (OOM, driver wedged, no compatible cubin)
+                // spins here, claiming + downloading fragments as fast as the
+                // network allows and burning the work pool for nothing.
+                thread::sleep(Duration::from_secs(args.idle_secs));
             }
         }
     }
@@ -798,10 +852,15 @@ fn run_worker(args: RunArgs, status: Status) -> Result<()> {
     }
     let mut runners = Vec::new();
     for _ in 0..jobs {
-        let (ready_rx, inflight, done_tx) = (ready_rx.clone(), inflight.clone(), done_tx.clone());
+        let (args, ready_rx, inflight, done_tx) = (
+            args.clone(),
+            ready_rx.clone(),
+            inflight.clone(),
+            done_tx.clone(),
+        );
         let status = status.clone();
         runners.push(thread::spawn(move || {
-            run_loop(ready_rx, inflight, done_tx, status)
+            run_loop(args, ready_rx, inflight, done_tx, status)
         }));
     }
     drop(done_tx);
@@ -843,5 +902,38 @@ mod tests {
         let bytes =
             decode_data_url("data:application/octet-stream;BASE64,aGVs\nbG8=").expect("decode");
         assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn prune_cache_evicts_down_to_cap_and_spares_in_progress() {
+        // Unique scratch dir so parallel test runs don't collide.
+        let dir = std::env::temp_dir().join(format!("decryptd-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Three finalized 10-byte blobs (30 B) plus an in-progress .part that
+        // eviction must never touch even though we're over the cap.
+        for name in ["aaa", "bbb", "ccc"] {
+            std::fs::write(dir.join(name), [0u8; 10]).unwrap();
+        }
+        std::fs::write(dir.join("pending-download.tmp.part"), [0u8; 10]).unwrap();
+
+        // Cap at 15 B: must evict finalized blobs until <= 15 (keeps exactly one),
+        // leaving the .part alone.
+        prune_cache(&dir, 15);
+
+        let finalized = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| !n.ends_with(".part"))
+            .count();
+        assert_eq!(finalized, 1, "should evict down to one finalized blob");
+        assert!(
+            dir.join("pending-download.tmp.part").exists(),
+            "in-progress .part must survive eviction"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
