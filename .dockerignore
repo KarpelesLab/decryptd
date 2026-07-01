@@ -1,0 +1,3 @@
+# The Dockerfile pulls the release binary; nothing from the repo is needed in the
+# build context, so ignore everything (keeps the context tiny — no multi-GB target/).
+*

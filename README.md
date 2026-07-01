@@ -67,6 +67,24 @@ nohup ./decryptd >decryptd.log 2>&1 &
 For an always-on contributor, run it under a service manager (systemd on Linux,
 a scheduled task / service on Windows) so it restarts on boot.
 
+### Run in a container
+
+The included `Dockerfile` builds a small (~250 MB) image containing just the
+worker. The GPU is supplied at run time by the
+[NVIDIA container runtime](https://github.com/NVIDIA/nvidia-container-toolkit) —
+no CUDA toolkit or GUI libraries go in the image.
+
+```sh
+docker build -t decryptd .
+docker run -d --name decryptd --restart unless-stopped --gpus all \
+  -v decryptd-data:/data decryptd
+```
+
+Mount a volume at `/data` to keep the worker id and download cache across
+restarts. On **RunPod** (or any container host), push the image to a registry and
+use it as the pod's image: the entrypoint launches the worker, so it starts
+automatically and comes back after a restart — no systemd needed.
+
 ### Options
 
 You normally don't need any of these.
