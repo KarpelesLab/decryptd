@@ -161,7 +161,25 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Parse a 64-char hex SHA-256 into raw bytes, or `None` if it isn't one.
+fn parse_sha256_hex(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 32 * 2 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
 /// Download a Job.Data blob from its inline URL, caching it under its content hash.
+///
+/// These blobs can be hundreds of MiB, so the body is *streamed to a file*
+/// rather than buffered in memory. rsurl's resumable downloader continues a
+/// partial `.part` across retries and process restarts (so a dropped
+/// connection resumes instead of restarting), fetches segments in parallel,
+/// and — given the content hash — verifies the finished file end-to-end.
 fn fetch_blob(args: &RunArgs, d: &DataRef) -> Result<Vec<u8>> {
     let url = d
         .url
@@ -178,24 +196,29 @@ fn fetch_blob(args: &RunArgs, d: &DataRef) -> Result<Vec<u8>> {
         return Ok(bytes); // cache hit
     }
     eprintln!("[decryptd] downloading {}", d.filename);
-    let resp = rsurl::Request::new("GET", url)
-        .map_err(|e| anyhow!("{e}"))?
-        .max_time(Duration::from_secs(300))
-        .send()
-        .map_err(|e| anyhow!("GET {url}: {e}"))?;
-    if resp.status >= 400 {
-        bail!("GET {url} → HTTP {}", resp.status);
+
+    // Download straight into the cache path when we have a stable key (rsurl
+    // manages the sibling `.part` and finalizes atomically); otherwise a temp
+    // file we read back and delete. rsurl's URL validator guards the fixed temp
+    // path against a stale partial from a different blob.
+    let (target, is_temp) = match &cache_path {
+        Some(p) => (p.clone(), false),
+        None => (cache.join("pending-download.tmp"), true),
+    };
+    let opts = rsurl::DownloadOptions {
+        segment_size: Some(16 * 1024 * 1024),
+        parallelism: 4,
+        max_time: Some(Duration::from_secs(300)),
+        expected_sha256: parse_sha256_hex(&d.hash),
+        ..Default::default()
+    };
+    rsurl::download(url, &target, opts).map_err(|e| anyhow!("GET {url}: {e}"))?;
+
+    let bytes = std::fs::read(&target)?;
+    if is_temp {
+        let _ = std::fs::remove_file(&target);
     }
-    if !d.hash.is_empty() {
-        let got = sha256_hex(&resp.body);
-        if got != d.hash {
-            bail!("sha256 mismatch for {url}: got {got}, want {}", d.hash);
-        }
-    }
-    if let Some(p) = &cache_path {
-        std::fs::write(p, &resp.body)?;
-    }
-    Ok(resp.body)
+    Ok(bytes)
 }
 
 /// Unpack engine.zip: parse `manifest.json` and collect every `*.sm<NN>.cubin`'s
