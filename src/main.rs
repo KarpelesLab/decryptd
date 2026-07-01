@@ -491,6 +491,9 @@ struct FinishedJob {
     download_secs: f64,
     /// Arch tag of the cubin that ran (`X*10+Y`), reported as `sm<NN>` at submit.
     cubin_arch: u32,
+    /// Which GPU ran it: the ordinal and the device name.
+    gpu_idx: i32,
+    gpu_name: String,
 }
 
 /// Fragments currently somewhere in the pipeline (claimed → run → submit), mapping
@@ -823,12 +826,10 @@ fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJo
     let gpu = cuda::Gpu::load_first(ordinal, &job.cubins).map_err(|e| anyhow!(e))?;
     let (maj, min) = gpu.compute_capability();
     let cubin_arch = gpu.cubin_arch();
+    let gpu_name = gpu.device_name();
     eprintln!(
-        "[decryptd] running [{}, {}) on GPU#{ordinal} {} (sm_{maj}{min}, cubin sm{cubin_arch}): entry={}",
-        job.start,
-        job.end,
-        gpu.device_name(),
-        job.manifest.entry,
+        "[decryptd] running [{}, {}) on GPU#{ordinal} {gpu_name} (sm_{maj}{min}, cubin sm{cubin_arch}): entry={}",
+        job.start, job.end, job.manifest.entry,
     );
     let t0 = Instant::now();
     let output = cuda::run_job(
@@ -870,6 +871,8 @@ fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJo
         run_secs,
         download_secs: job.download_secs,
         cubin_arch,
+        gpu_idx: ordinal,
+        gpu_name,
     })
 }
 
@@ -899,6 +902,8 @@ fn submit_job(ctx: &RestContext, response_key: &str, job: &FinishedJob) -> Resul
         "cubin".to_string(),
         Value::String(format!("sm{}", job.cubin_arch)),
     );
+    params.insert("gpu_idx".to_string(), Value::from(job.gpu_idx));
+    params.insert("gpu_name".to_string(), Value::String(job.gpu_name.clone()));
     params.insert(
         "version".to_string(),
         Value::String(env!("CARGO_PKG_VERSION").to_string()),
