@@ -1,0 +1,68 @@
+name: Docker
+
+# Build the container image and push it to GHCR, tagged with the release version
+# and `latest`. Two triggers:
+#   * manual — run it for any existing release (blank tag = the latest release);
+#   * automatic — after the Release workflow finishes, so a new release also ships
+#     an image.
+# The image pulls the pinned release asset (`.../download/<tag>/...`), which the
+# Release must have published first — hence "after Release", never a bare tag push.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build (e.g. v0.1.19). Blank = latest release."
+        required: false
+        type: string
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    name: Build & push to GHCR
+    runs-on: ubuntu-latest
+    # On the automatic trigger, only proceed if the Release actually succeeded.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve tag + release asset URL
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            tag="${{ github.event.workflow_run.head_branch }}"
+          else
+            tag="${{ inputs.tag }}"
+          fi
+          # Fall back to the newest release (covers a blank manual input, and a
+          # workflow_run whose head_branch isn't the tag).
+          if [ -z "$tag" ]; then
+            tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          fi
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"   # GHCR names are lowercase
+          ver="${tag#v}"                          # v0.1.19 -> 0.1.19
+          echo "building $repo for $tag"
+          echo "tags=${repo}:${ver},${repo}:latest" >> "$GITHUB_OUTPUT"
+          echo "asset=https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/decryptd-linux-x86_64.tar.gz" >> "$GITHUB_OUTPUT"
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            DECRYPTD_URL=${{ steps.meta.outputs.asset }}

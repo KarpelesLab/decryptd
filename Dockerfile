@@ -31,7 +31,8 @@ ARG DECRYPTD_URL=https://github.com/KarpelesLab/decryptd/releases/latest/downloa
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates curl; \
-    curl -fSL "$DECRYPTD_URL" | tar -xz --no-same-owner -C /usr/local/bin decryptd; \
+    curl -fSL --retry 5 --retry-delay 3 --retry-all-errors "$DECRYPTD_URL" \
+      | tar -xz --no-same-owner -C /usr/local/bin decryptd; \
     chmod +x /usr/local/bin/decryptd; \
     apt-get purge -y --auto-remove curl ca-certificates; \
     rm -rf /var/lib/apt/lists/*
