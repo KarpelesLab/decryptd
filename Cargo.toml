@@ -1,6 +1,6 @@
 [package]
 name = "decryptd"
-version = "0.1.18"
+version = "0.1.19"
 edition = "2024"
 license = "Proprietary"
 authors = ["Karpeles Lab Inc"]
@@ -63,6 +63,9 @@ rsupd = "0.3"
 # notify-rust. `image` decodes the embedded PNG into the RGBA an ldtray Icon wants.
 ldtray = { version = "0.1.1", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+# Runtime-load libnvidia-ml (NVML, part of the driver) for live GPU temperature /
+# power in the tray — no build-time link, and absent NVML just hides the readout.
+libloading = { version = "0.8", optional = true }
 
 # Embeds the application icon (and version info) into decryptd.exe. Host-gated:
 # only pulled in when the build *host* is Windows (the release runner), where
@@ -76,4 +79,4 @@ winresource = "0.1"
 # so a single build serves both desktops and servers — no separate console variant.
 # `--no-default-features` drops the tray (and its deps) for a pure worker binary.
 default = ["gui"]
-gui = ["dep:ldtray", "dep:image"]
+gui = ["dep:ldtray", "dep:image", "dep:libloading"]

@@ -16,12 +16,23 @@
 //! Paused, or the reason it's idle), one disabled line per GPU in use, a
 //! Pause/Resume toggle, a "Check for Updates" item, and Quit.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use ldtray::{Event, Icon, Menu, MenuId, MenuItem, Notification, Tray, TrayConfig, TrayHandle};
 
+use crate::nvml::Nvml;
 use crate::{RunArgs, Status};
+
+/// A GPU decryptd is using, resolved once at startup. `pci_bus_id` keys the live
+/// NVML temperature/power lookup.
+#[derive(Clone)]
+struct GpuInfo {
+    ordinal: i32,
+    name: String,
+    pci_bus_id: Option<String>,
+}
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The app logo, decoded + scaled to the tray icon at startup.
@@ -38,7 +49,9 @@ const ID_QUIT: u32 = 3;
 /// created — a headless box with no display/notification host — fall back to just
 /// running the worker.
 pub fn run_with_tray(args: RunArgs, status: Status) -> Result<()> {
-    let gpu_labels = gpu_labels(&args);
+    let gpus: Arc<Vec<GpuInfo>> = Arc::new(gpu_infos(&args));
+    // NVML (driver-provided) for live temp/power; None → the tray just omits it.
+    let nvml: Option<Arc<Nvml>> = Nvml::load().map(Arc::new);
 
     let icon = match load_icon() {
         Ok(icon) => icon,
@@ -49,7 +62,7 @@ pub fn run_with_tray(args: RunArgs, status: Status) -> Result<()> {
     };
     let config = TrayConfig::new(icon)
         .tooltip(format!("decryptd v{VERSION}"))
-        .menu(build_menu(&status, &gpu_labels));
+        .menu(build_menu(&status, &gpus, nvml.as_deref()));
     let tray = match Tray::new(config) {
         Ok(tray) => tray,
         Err(e) => {
@@ -76,13 +89,18 @@ pub fn run_with_tray(args: RunArgs, status: Status) -> Result<()> {
         });
     }
 
-    // Rebuild the menu once a second so the status + pause lines track the worker.
+    // Rebuild the menu once a second so status, speed, and live GPU telemetry
+    // track the worker. NVML reads are sub-millisecond, so this cadence is cheap.
     {
-        let (status, handle, gpu_labels) = (status.clone(), handle.clone(), gpu_labels.clone());
+        let (status, handle, gpus, nvml) =
+            (status.clone(), handle.clone(), gpus.clone(), nvml.clone());
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_secs(1));
-                if handle.set_menu(build_menu(&status, &gpu_labels)).is_err() {
+                if handle
+                    .set_menu(build_menu(&status, &gpus, nvml.as_deref()))
+                    .is_err()
+                {
                     break; // tray loop gone
                 }
             }
@@ -105,7 +123,7 @@ pub fn run_with_tray(args: RunArgs, status: Status) -> Result<()> {
                 ID_PAUSE => {
                     status.set_paused(!status.is_paused());
                     // Flip the label immediately rather than waiting for the tick.
-                    let _ = cb.set_menu(build_menu(&status, &gpu_labels));
+                    let _ = cb.set_menu(build_menu(&status, &gpus, nvml.as_deref()));
                 }
                 ID_CHECK => trigger_update_check(cb.clone()),
                 _ => {}
@@ -116,22 +134,42 @@ pub fn run_with_tray(args: RunArgs, status: Status) -> Result<()> {
     Ok(())
 }
 
-/// The GPUs decryptd will use, as menu-ready labels (`GPU#0: <name>`). Mirrors the
-/// worker's own selection (`--gpus`, else all detected) so the tray shows exactly
-/// what's in play. Best-effort: any probe failure collapses to a single note.
-fn gpu_labels(args: &RunArgs) -> Vec<String> {
+/// The GPUs decryptd will use, resolved once at startup. Mirrors the worker's own
+/// selection (`--gpus`, else all detected). Best-effort; empty when none detected.
+fn gpu_infos(args: &RunArgs) -> Vec<GpuInfo> {
     let count = match crate::cuda::device_count() {
         Ok(n) if n > 0 => n,
-        _ => return vec!["GPU: none detected".to_string()],
+        _ => return Vec::new(),
     };
     let ordinals = crate::select_gpus(&args.gpus, count).unwrap_or_else(|_| (0..count).collect());
     ordinals
         .iter()
-        .map(|&o| {
-            let name = crate::cuda::device_name(o).unwrap_or_else(|_| "unknown".to_string());
-            format!("GPU#{o}: {name}")
+        .map(|&ordinal| GpuInfo {
+            ordinal,
+            name: crate::cuda::device_name(ordinal).unwrap_or_else(|_| "unknown".to_string()),
+            pci_bus_id: crate::cuda::pci_bus_id(ordinal),
         })
         .collect()
+}
+
+/// One GPU's menu line: `GPU#0: NVIDIA GeForce RTX 3080 — 72 °C, 220 W`, with the
+/// telemetry appended only when NVML can supply it.
+fn gpu_line(info: &GpuInfo, nvml: Option<&Nvml>) -> String {
+    let mut line = format!("GPU#{}: {}", info.ordinal, info.name);
+    if let (Some(nvml), Some(pci)) = (nvml, info.pci_bus_id.as_deref()) {
+        let t = nvml.telemetry(pci);
+        let mut extra: Vec<String> = Vec::new();
+        if let Some(c) = t.temp_c {
+            extra.push(format!("{c} °C"));
+        }
+        if let Some(w) = t.power_w {
+            extra.push(format!("{w:.0} W"));
+        }
+        if !extra.is_empty() {
+            line = format!("{line} — {}", extra.join(", "));
+        }
+    }
+    line
 }
 
 /// Decode the embedded logo into the small RGBA image an ldtray [`Icon`] wants.
@@ -195,7 +233,7 @@ fn pause_label(status: &Status) -> &'static str {
 /// Build the context menu for the current worker state. ldtray menus are
 /// immutable snapshots, so the refresher re-renders this and pushes it via
 /// [`TrayHandle::set_menu`] whenever the status changes.
-fn build_menu(status: &Status, gpu_labels: &[String]) -> Menu {
+fn build_menu(status: &Status, gpus: &[GpuInfo], nvml: Option<&Nvml>) -> Menu {
     let mut menu = Menu::new()
         .item(MenuItem::button(ID_INERT, format!("decryptd v{VERSION}")).enabled(false))
         .item(MenuItem::button(ID_INERT, status_label(status)).enabled(false));
@@ -207,9 +245,12 @@ fn build_menu(status: &Status, gpu_labels: &[String]) -> Menu {
         );
     }
     menu = menu.item(MenuItem::separator());
-    // One disabled line per GPU decryptd is using.
-    for label in gpu_labels {
-        menu = menu.item(MenuItem::button(ID_INERT, label.clone()).enabled(false));
+    // One disabled line per GPU, with live temperature / power when NVML is there.
+    if gpus.is_empty() {
+        menu = menu.item(MenuItem::button(ID_INERT, "GPU: none detected").enabled(false));
+    }
+    for info in gpus {
+        menu = menu.item(MenuItem::button(ID_INERT, gpu_line(info, nvml)).enabled(false));
     }
     menu.item(MenuItem::separator())
         .item(MenuItem::button(ID_PAUSE, pause_label(status)))

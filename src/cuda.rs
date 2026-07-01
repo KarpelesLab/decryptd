@@ -31,6 +31,10 @@ unsafe extern "C" {
     fn cuDeviceGet(device: *mut CuDevice, ordinal: i32) -> CuResult;
     fn cuDeviceGetAttribute(pi: *mut i32, attrib: i32, dev: CuDevice) -> CuResult;
     fn cuDeviceGetName(name: *mut c_char, len: i32, dev: CuDevice) -> CuResult;
+    // Used only by the GUI's NVML telemetry, to map a CUDA ordinal to its physical
+    // GPU (NVML doesn't honor CUDA_VISIBLE_DEVICES; the PCI id is the shared key).
+    #[cfg(all(feature = "gui", any(target_os = "linux", target_os = "windows")))]
+    fn cuDeviceGetPCIBusId(pci_bus_id: *mut c_char, len: i32, dev: CuDevice) -> CuResult;
     fn cuCtxCreate_v2(pctx: *mut CuContext, flags: u32, dev: CuDevice) -> CuResult;
     fn cuCtxDestroy_v2(ctx: CuContext) -> CuResult;
     fn cuModuleLoadData(module: *mut CuModule, image: *const c_void) -> CuResult;
@@ -146,6 +150,26 @@ pub fn device_name(ordinal: i32) -> Result<String, String> {
         Ok(CStr::from_ptr(buf.as_ptr() as *const c_char)
             .to_string_lossy()
             .into_owned())
+    }
+}
+
+/// PCI bus id of device `ordinal` (e.g. `0000:01:00.0`), the stable key NVML uses
+/// to identify the same physical GPU. `None` if it can't be read.
+#[cfg(all(feature = "gui", any(target_os = "linux", target_os = "windows")))]
+pub fn pci_bus_id(ordinal: i32) -> Option<String> {
+    unsafe {
+        check(cuInit(0), "cuInit").ok()?;
+        let mut dev: CuDevice = 0;
+        check(cuDeviceGet(&mut dev, ordinal), "cuDeviceGet").ok()?;
+        let mut buf = [0i8; 32];
+        if cuDeviceGetPCIBusId(buf.as_mut_ptr() as *mut c_char, buf.len() as i32, dev) != 0 {
+            return None;
+        }
+        Some(
+            CStr::from_ptr(buf.as_ptr() as *const c_char)
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
 }
 

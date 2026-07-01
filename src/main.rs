@@ -32,6 +32,8 @@
 mod cuda;
 #[cfg(all(feature = "gui", any(target_os = "linux", target_os = "windows")))]
 mod gui;
+#[cfg(all(feature = "gui", any(target_os = "linux", target_os = "windows")))]
+mod nvml;
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Cursor, Read};
@@ -1239,6 +1241,23 @@ mod tests {
         assert_eq!(load_or_create_worker_id(&dir).unwrap(), "my-pinned-id");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Live NVML probe on real hardware (needs a GPU + driver). Run manually:
+    //   cargo test -- --ignored --nocapture nvml_reads
+    #[cfg(all(feature = "gui", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    #[ignore]
+    fn nvml_reads_gpu_telemetry() {
+        let pci = crate::cuda::pci_bus_id(0).expect("pci bus id for GPU 0");
+        println!("GPU0 pci = {pci}");
+        let nvml = crate::nvml::Nvml::load().expect("load NVML");
+        let t = nvml.telemetry(&pci);
+        println!("temp = {:?} °C, power = {:?} W", t.temp_c, t.power_w);
+        assert!(
+            t.temp_c.is_some() || t.power_w.is_some(),
+            "expected NVML to report at least one metric"
+        );
     }
 
     #[test]
