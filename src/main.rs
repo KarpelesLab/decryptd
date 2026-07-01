@@ -921,20 +921,15 @@ fn upload_loop(ctx: RestContext, inflight: InFlight, done: Arc<Mutex<Receiver<Fi
 /// Trust anchor for self-updates: the SHA-256 fingerprint of the decryptd
 /// release signing key (`rsupd id export`). It's a hash of a public key, so it's
 /// safe to embed; the updater refuses any manifest not signed by the matching
-/// private identity. GUI-build only — the console `-server` build has no updater.
-#[cfg(feature = "gui")]
+/// private identity.
 const RSUPD_FINGERPRINT: &str = "80b9edc7e6eaebf10b2a25bb10556b9b7fa6abc9fbe556706a2b680cefa4a0fc";
 
 /// Build the signed auto-updater. The transport (dist-go over rsurl) and channel
 /// (`master`) default from the fingerprint, so the anchor is the only required
 /// input. The git stamps from `build.rs` let it also spot a newer build of the
-/// same version (and never reinstall the identical build).
-///
-/// GUI-build only. The dist backend keys releases by `(fingerprint, version)`, so
-/// with a single signing identity two variants can't publish the same version;
-/// the headless build therefore ships without an updater (download-only). Giving
-/// the server its own auto-update stream would need a second signing identity.
-#[cfg(feature = "gui")]
+/// same version (and never reinstall the identical build). Every release is one
+/// build (the tray degrades to headless via ldtray), so there's a single update
+/// stream for all workers.
 fn build_updater() -> rsupd::Result<rsupd::Updater> {
     rsupd::Updater::builder(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
         .fingerprint_hex(RSUPD_FINGERPRINT)
@@ -950,12 +945,9 @@ fn main() -> Result<()> {
     let args = RunArgs::parse();
     let status = Status::default();
 
-    // Self-update is a GUI-build feature only (see `build_updater`): with one
-    // signing identity the headless build can't have an independent update stream,
-    // so it ships download-only. Long-lived GUI workers keep themselves current:
-    // check hourly in the background and restart into each new signed build.
-    // `--once` is short-lived, so it skips the updater.
-    #[cfg(feature = "gui")]
+    // Long-lived workers keep themselves current: check hourly in the background
+    // and restart into each new signed build. `--once` is short-lived, so it skips
+    // the updater.
     if !args.once {
         match build_updater() {
             Ok(updater) => {
@@ -1147,9 +1139,12 @@ mod tests {
         // Explicit --workdir is always honored verbatim.
         let a = RunArgs::parse_from(["decryptd", "--workdir", "/tmp/custom-wd"]);
         assert_eq!(a.workdir(), PathBuf::from("/tmp/custom-wd"));
-        // In the (non-gui) test build the default is the CWD-relative folder.
+        // With no flag, workdir() resolves to the default.
         let b = RunArgs::parse_from(["decryptd"]);
         assert_eq!(b.workdir(), default_workdir());
+        // Without the tray the default is the CWD-relative folder; the gui build
+        // uses a per-user data dir (env-dependent, so not asserted here).
+        #[cfg(not(feature = "gui"))]
         assert_eq!(default_workdir(), PathBuf::from("decryptd-data"));
     }
 
