@@ -474,6 +474,8 @@ struct ReadyJob {
     /// Arch-tagged cubins, highest arch first (see [`Cubin`]).
     cubins: Vec<Cubin>,
     data: Vec<u8>,
+    /// Wall-clock seconds spent fetching this job's blobs (0 on a full cache hit).
+    download_secs: f64,
 }
 
 /// A fragment that's finished on the GPU — ready to compress + submit.
@@ -483,7 +485,12 @@ struct FinishedJob {
     end: u64,
     record_size: u32,
     output: Vec<u8>,
+    /// Seconds the GPU spent on this fragment.
     run_secs: f64,
+    /// Seconds spent downloading this job's blobs (carried from [`ReadyJob`]).
+    download_secs: f64,
+    /// Arch tag of the cubin that ran (`X*10+Y`), reported as `sm<NN>` at submit.
+    cubin_arch: u32,
 }
 
 /// Fragments currently somewhere in the pipeline (claimed → run → submit), mapping
@@ -693,6 +700,8 @@ fn claim_and_fetch(
     let fetched = (|| -> Result<ReadyJob> {
         let mut engine_zip: Option<Vec<u8>> = None;
         let mut data_blob: Option<(String, Vec<u8>)> = None;
+        // Time just the blob fetches (0 on a full cache hit) — reported at submit.
+        let dl_start = Instant::now();
         for d in &pull.job.data {
             let bytes = fetch_blob(args, downloads, d)?;
             if d.filename.ends_with(".zip") {
@@ -701,6 +710,7 @@ fn claim_and_fetch(
                 data_blob = Some((d.filename.clone(), bytes));
             }
         }
+        let download_secs = dl_start.elapsed().as_secs_f64();
         let engine_zip = engine_zip.ok_or_else(|| anyhow!("job has no engine .zip blob"))?;
         let (manifest, cubins) = unpack_engine(&engine_zip)?;
         let data = match data_blob {
@@ -714,6 +724,7 @@ fn claim_and_fetch(
             manifest,
             cubins,
             data,
+            download_secs,
         })
     })();
 
@@ -811,8 +822,9 @@ fn decode_stream(dec: &mut dyn compcol::Decoder, input: &[u8]) -> Result<Vec<u8>
 fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJob> {
     let gpu = cuda::Gpu::load_first(ordinal, &job.cubins).map_err(|e| anyhow!(e))?;
     let (maj, min) = gpu.compute_capability();
+    let cubin_arch = gpu.cubin_arch();
     eprintln!(
-        "[decryptd] running [{}, {}) on GPU#{ordinal} {} (sm_{maj}{min}): entry={}",
+        "[decryptd] running [{}, {}) on GPU#{ordinal} {} (sm_{maj}{min}, cubin sm{cubin_arch}): entry={}",
         job.start,
         job.end,
         gpu.device_name(),
@@ -856,7 +868,15 @@ fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJo
         record_size: job.manifest.record_size,
         output,
         run_secs,
+        download_secs: job.download_secs,
+        cubin_arch,
     })
+}
+
+/// Round a seconds value to milliseconds and wrap it as a JSON number, so submit
+/// telemetry carries `1.234` rather than a long float tail.
+fn round_ms(secs: f64) -> Value {
+    Value::from((secs * 1000.0).round() / 1000.0)
 }
 
 /// Compress a finished fragment's records and submit them via `Decrypt/Job:submit`
@@ -871,6 +891,18 @@ fn submit_job(ctx: &RestContext, response_key: &str, job: &FinishedJob) -> Resul
         "response_key".to_string(),
         Value::String(response_key.to_string()),
     );
+    // Telemetry for the platform: how long the blobs took to fetch, how long the
+    // GPU ran, which cubin arch actually executed (sm89, …), and the worker build.
+    params.insert("download_seconds".to_string(), round_ms(job.download_secs));
+    params.insert("run_seconds".to_string(), round_ms(job.run_secs));
+    params.insert(
+        "cubin".to_string(),
+        Value::String(format!("sm{}", job.cubin_arch)),
+    );
+    params.insert(
+        "version".to_string(),
+        Value::String(env!("CARGO_PKG_VERSION").to_string()),
+    );
     klbfw::upload(
         ctx,
         "Decrypt/Job:submit",
@@ -882,8 +914,8 @@ fn submit_job(ctx: &RestContext, response_key: &str, job: &FinishedJob) -> Resul
     )
     .map_err(|e| anyhow!("Decrypt/Job:submit: {e}"))?;
     eprintln!(
-        "[decryptd] submitted {records} record(s) ({packed_len} B xz) for [{}, {}) (ran {:.1}s)",
-        job.start, job.end, job.run_secs
+        "[decryptd] submitted {records} record(s) ({packed_len} B xz) for [{}, {}) (ran {:.1}s, dl {:.1}s)",
+        job.start, job.end, job.run_secs, job.download_secs
     );
     Ok(())
 }

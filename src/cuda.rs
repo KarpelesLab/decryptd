@@ -178,6 +178,8 @@ pub struct Gpu {
     ctx: CuContext,
     module: CuModule,
     dev: CuDevice,
+    /// Arch tag (`X*10+Y`) of the cubin that actually loaded, e.g. 89 for sm_89.
+    arch: u32,
 }
 
 impl Gpu {
@@ -222,7 +224,12 @@ impl Gpu {
                 let mut module: CuModule = ptr::null_mut();
                 let r = cuModuleLoadData(&mut module, cubin.as_ptr() as *const c_void);
                 if r == 0 {
-                    return Ok(Gpu { ctx, module, dev });
+                    return Ok(Gpu {
+                        ctx,
+                        module,
+                        dev,
+                        arch: *arch,
+                    });
                 }
                 last = check(r, "cuModuleLoadData").unwrap_err();
             }
@@ -250,6 +257,12 @@ impl Gpu {
             cuDeviceGetAttribute(&mut min, CU_DEV_ATTR_CC_MINOR, self.dev);
         }
         (maj, min)
+    }
+
+    /// Arch tag of the cubin that loaded (`X*10+Y`, e.g. 89 for the sm_89 cubin) —
+    /// which may be lower than the GPU's own capability if that's the best match.
+    pub fn cubin_arch(&self) -> u32 {
+        self.arch
     }
 
     fn function(&self, name: &str) -> Result<CuFunction, String> {
