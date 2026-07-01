@@ -178,8 +178,13 @@ fn parse_sha256_hex(hex: &str) -> Option<[u8; 32]> {
 /// These blobs can be hundreds of MiB, so the body is *streamed to a file*
 /// rather than buffered in memory. rsurl's resumable downloader continues a
 /// partial `.part` across retries and process restarts (so a dropped
-/// connection resumes instead of restarting), fetches segments in parallel,
-/// and — given the content hash — verifies the finished file end-to-end.
+/// connection resumes instead of restarting) and — given the content hash —
+/// verifies the finished file end-to-end.
+///
+/// Single-stream (not segmented/parallel): segmented mode probes the size with
+/// a `HEAD`, but these blob URLs are SigV4-presigned for `GET` only, so a
+/// `HEAD` returns 403. A plain `GET` stream still gets the essentials — no
+/// size cap, and `Range`-based resume on a drop.
 fn fetch_blob(args: &RunArgs, d: &DataRef) -> Result<Vec<u8>> {
     let url = d
         .url
@@ -206,8 +211,6 @@ fn fetch_blob(args: &RunArgs, d: &DataRef) -> Result<Vec<u8>> {
         None => (cache.join("pending-download.tmp"), true),
     };
     let opts = rsurl::DownloadOptions {
-        segment_size: Some(16 * 1024 * 1024),
-        parallelism: 4,
         max_time: Some(Duration::from_secs(300)),
         expected_sha256: parse_sha256_hex(&d.hash),
         ..Default::default()
