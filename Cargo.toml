@@ -1,6 +1,6 @@
 [package]
 name = "decryptd"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2024"
 license = "Proprietary"
 authors = ["Karpeles Lab Inc"]
@@ -25,6 +25,9 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Persistent per-worker id (UUIDv7, time-ordered) sent with every pullOne so the
+# platform can attribute a worker's work across restarts.
+uuid = { version = "1", features = ["v7"] }
 purecrypto = { version = "0.6.7", features = ["hazmat-secp256k1"] }
 # Pinned to the same major as klbfw's rsurl (0.1) — two rsurl versions in one binary
 # collide on its C FFI symbols (duplicate-symbol link error).

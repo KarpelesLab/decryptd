@@ -47,6 +47,7 @@ use clap::Parser;
 use klbfw::{Config, RestContext};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 /// Run as a worker: claim Decrypt/Job fragments, run the kernel, submit results.
 #[derive(Parser)]
@@ -533,11 +534,16 @@ impl Drop for RunGuard {
 fn claim_and_fetch(
     args: &RunArgs,
     downloads: &Downloads,
+    worker_id: &str,
     ctx: &RestContext,
     inflight: &InFlight,
 ) -> Result<Option<ReadyJob>> {
     let resp = ctx
-        .do_request("Decrypt/Job:pullOne", "POST", json!({}))
+        .do_request(
+            "Decrypt/Job:pullOne",
+            "POST",
+            json!({ "worker": worker_id }),
+        )
         .map_err(|e| anyhow!("Decrypt/Job:pullOne: {e}"))?;
     // pullOne returns null data when there are no open jobs with fragments to issue.
     let Some(data) = resp.raw().filter(|v| !v.is_null()) else {
@@ -760,6 +766,7 @@ fn submit_job(ctx: &RestContext, response_key: &str, job: &FinishedJob) -> Resul
 fn prefetch_loop(
     args: Arc<RunArgs>,
     downloads: Downloads,
+    worker_id: String,
     ctx: RestContext,
     inflight: InFlight,
     ready: SyncSender<ReadyJob>,
@@ -768,7 +775,7 @@ fn prefetch_loop(
     loop {
         // Don't claim new work while paused.
         status.wait_while_paused();
-        match claim_and_fetch(&args, &downloads, &ctx, &inflight) {
+        match claim_and_fetch(&args, &downloads, &worker_id, &ctx, &inflight) {
             Ok(Some(job)) => {
                 if ready.send(job).is_err() {
                     return; // pipeline shut down
@@ -925,11 +932,31 @@ fn select_gpus(spec: &Option<String>, count: i32) -> Result<Vec<i32>> {
     Ok(ords)
 }
 
+/// Load this worker's persistent id from `<workdir>/worker-id`, or mint a new
+/// UUIDv7 and save it. Sent as `worker=<id>` on every pullOne so the platform can
+/// attribute a worker's fragments across restarts. Any non-empty existing content
+/// is kept verbatim (so an operator can pin a chosen id); only a missing or blank
+/// file triggers generation.
+fn load_or_create_worker_id(workdir: &Path) -> Result<String> {
+    let path = workdir.join("worker-id");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim();
+        if !existing.is_empty() {
+            return Ok(existing.to_string());
+        }
+    }
+    let id = Uuid::now_v7().to_string();
+    std::fs::write(&path, &id).with_context(|| format!("writing {}", path.display()))?;
+    eprintln!("[decryptd] generated worker id {id} ({})", path.display());
+    Ok(id)
+}
+
 fn run_worker(args: RunArgs, status: Status) -> Result<()> {
     std::fs::create_dir_all(&args.workdir)?;
     let ctx = RestContext::with_config(Config::new("https".to_string(), args.host.clone()))
         .with_debug(std::env::var("DECRYPTD_DEBUG").is_ok());
     let jobs = args.jobs.max(1);
+    let worker_id = load_or_create_worker_id(&args.workdir)?;
 
     let count = cuda::device_count().map_err(|e| anyhow!("enumerating GPUs: {e}"))?;
     if count < 1 {
@@ -943,7 +970,7 @@ fn run_worker(args: RunArgs, status: Status) -> Result<()> {
     if args.once {
         // Single fragment on the first selected GPU.
         let ord = gpus[0];
-        return match claim_and_fetch(&args, &downloads, &ctx, &inflight)? {
+        return match claim_and_fetch(&args, &downloads, &worker_id, &ctx, &inflight)? {
             Some(job) => {
                 let key = inflight.lock().unwrap().get(&job.frag_id).cloned();
                 let key = key.ok_or_else(|| anyhow!("fragment lost its response key"))?;
@@ -957,7 +984,7 @@ fn run_worker(args: RunArgs, status: Status) -> Result<()> {
     }
 
     eprintln!(
-        "[decryptd] host={} GPUs={gpus:?} jobs={jobs}/GPU ({} runner(s) total)",
+        "[decryptd] host={} worker={worker_id} GPUs={gpus:?} jobs={jobs}/GPU ({} runner(s) total)",
         args.host,
         gpus.len() * jobs
     );
@@ -976,14 +1003,17 @@ fn run_worker(args: RunArgs, status: Status) -> Result<()> {
         let done_rx = Arc::new(Mutex::new(done_rx));
 
         {
-            let (args, downloads, ctx, inflight, status) = (
+            let (args, downloads, ctx, inflight, status, worker_id) = (
                 args.clone(),
                 downloads.clone(),
                 ctx.clone(),
                 inflight.clone(),
                 status.clone(),
+                worker_id.clone(),
             );
-            thread::spawn(move || prefetch_loop(args, downloads, ctx, inflight, ready_tx, status));
+            thread::spawn(move || {
+                prefetch_loop(args, downloads, worker_id, ctx, inflight, ready_tx, status)
+            });
         }
         for _ in 0..jobs {
             let (ctx, inflight, done_rx) = (ctx.clone(), inflight.clone(), done_rx.clone());
@@ -1041,6 +1071,27 @@ mod tests {
         let bytes =
             decode_data_url("data:application/octet-stream;BASE64,aGVs\nbG8=").expect("decode");
         assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn worker_id_persists_and_is_reused() {
+        let dir = std::env::temp_dir().join(format!("decryptd-wid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // First call mints a UUIDv7 and writes it.
+        let id1 = load_or_create_worker_id(&dir).unwrap();
+        assert_eq!(id1.len(), 36, "UUID string form");
+        assert_eq!(Uuid::parse_str(&id1).unwrap().get_version_num(), 7);
+        // Second call returns the same persisted id (no regeneration).
+        let id2 = load_or_create_worker_id(&dir).unwrap();
+        assert_eq!(id1, id2);
+
+        // A pinned (non-UUID) id is honored verbatim, trimmed of whitespace.
+        std::fs::write(dir.join("worker-id"), "  my-pinned-id\n").unwrap();
+        assert_eq!(load_or_create_worker_id(&dir).unwrap(), "my-pinned-id");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
