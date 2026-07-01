@@ -921,18 +921,26 @@ fn upload_loop(ctx: RestContext, inflight: InFlight, done: Arc<Mutex<Receiver<Fi
 /// Trust anchor for self-updates: the SHA-256 fingerprint of the decryptd
 /// release signing key (`rsupd id export`). It's a hash of a public key, so it's
 /// safe to embed; the updater refuses any manifest not signed by the matching
-/// private identity. GUI-build only — the console `-server` build has no updater.
-#[cfg(feature = "gui")]
+/// private identity.
 const RSUPD_FINGERPRINT: &str = "80b9edc7e6eaebf10b2a25bb10556b9b7fa6abc9fbe556706a2b680cefa4a0fc";
 
-/// Build the signed auto-updater. The transport (dist-go over rsurl) and channel
-/// (`master`) default from the fingerprint, so the anchor is the only required
-/// input. The git stamps from `build.rs` let it also spot a newer build of the
-/// same version (and never reinstall the identical build). GUI-build only.
+/// The update channel this build tracks. The GUI build follows `master` (rsupd's
+/// default); the headless build follows `server`, a separate channel carrying the
+/// no-GUI binary, so a console worker updates to another console build rather than
+/// the GTK-linked GUI one. CI publishes each channel from its own binary.
 #[cfg(feature = "gui")]
+const UPDATE_CHANNEL: &str = "master";
+#[cfg(not(feature = "gui"))]
+const UPDATE_CHANNEL: &str = "server";
+
+/// Build the signed auto-updater. The transport (dist-go over rsurl) defaults from
+/// the fingerprint, so the anchor + channel are the only required inputs. The git
+/// stamps from `build.rs` let it also spot a newer build of the same version (and
+/// never reinstall the identical build).
 fn build_updater() -> rsupd::Result<rsupd::Updater> {
     rsupd::Updater::builder(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
         .fingerprint_hex(RSUPD_FINGERPRINT)
+        .channel(UPDATE_CHANNEL)
         .git_tag(env!("RSUPD_GIT_TAG"))
         .date_tag(rsupd::date_tag_from_unix(env!("RSUPD_BUILD_UNIX")))
         .build()
@@ -945,13 +953,12 @@ fn main() -> Result<()> {
     let args = RunArgs::parse();
     let status = Status::default();
 
-    // Self-update is a GUI-build feature only. The headless `-server` build ships
-    // without it (operators update by re-downloading) — the master update channel
-    // carries the GTK-linked GUI binary, which wouldn't even start on a server, so
-    // a console build must never pull from it. Long-lived GUI workers keep
-    // themselves current: check hourly in the background and restart into each new
-    // signed build. `--once` is short-lived, so it skips the updater.
-    #[cfg(feature = "gui")]
+    // Long-lived workers keep themselves current: check hourly in the background
+    // and restart into each new signed build. Each variant tracks its own update
+    // channel (see `build_updater`) — the GUI build on `master`, the headless
+    // `-server` build on `server` — so a console worker never pulls the GTK-linked
+    // GUI binary, which wouldn't start on a display-less box. `--once` is
+    // short-lived, so it skips the updater.
     if !args.once {
         match build_updater() {
             Ok(updater) => {
