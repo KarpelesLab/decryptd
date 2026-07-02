@@ -398,7 +398,20 @@ fn decode_data_url(url: &str) -> Result<Vec<u8>> {
             .chars()
             .filter(|c| !c.is_ascii_whitespace())
             .collect();
-        base64::engine::general_purpose::STANDARD
+        // Be liberal in what we accept: the platform sometimes emits the payload
+        // without trailing `=` padding (which the strict STANDARD engine rejects
+        // as "Invalid padding") and sometimes in the URL-safe `-_` alphabet. Pick
+        // the alphabet from the payload and treat padding as optional.
+        use base64::alphabet;
+        use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+        let alpha = if cleaned.bytes().any(|b| b == b'-' || b == b'_') {
+            &alphabet::URL_SAFE
+        } else {
+            &alphabet::STANDARD
+        };
+        let cfg = GeneralPurposeConfig::new()
+            .with_decode_padding_mode(DecodePaddingMode::Indifferent);
+        GeneralPurpose::new(alpha, cfg)
             .decode(cleaned.as_bytes())
             .map_err(|e| anyhow!("decoding base64 data: URL: {e}"))
     } else {
@@ -1250,6 +1263,23 @@ mod tests {
         let bytes =
             decode_data_url("data:application/octet-stream;BASE64,aGVs\nbG8=").expect("decode");
         assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn data_url_base64_unpadded() {
+        // "hello" is 5 bytes → base64 "aGVsbG8=" with padding. The platform
+        // sometimes drops the trailing `=`; we must still decode it.
+        let bytes = decode_data_url("data:application/octet-stream;base64,aGVsbG8").expect("decode");
+        assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn data_url_base64_url_safe_alphabet() {
+        // 0xff 0xfe → standard "//4=", url-safe "__4" (unpadded). Exercises
+        // both the `-_` alphabet and missing padding at once.
+        let bytes =
+            decode_data_url("data:application/octet-stream;base64,__4").expect("decode");
+        assert_eq!(bytes, &[0xff, 0xfe]);
     }
 
     #[test]
