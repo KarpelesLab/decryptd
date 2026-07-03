@@ -409,8 +409,8 @@ fn decode_data_url(url: &str) -> Result<Vec<u8>> {
         } else {
             &alphabet::STANDARD
         };
-        let cfg = GeneralPurposeConfig::new()
-            .with_decode_padding_mode(DecodePaddingMode::Indifferent);
+        let cfg =
+            GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent);
         GeneralPurpose::new(alpha, cfg)
             .decode(cleaned.as_bytes())
             .map_err(|e| anyhow!("decoding base64 data: URL: {e}"))
@@ -1347,7 +1347,8 @@ mod tests {
     fn data_url_base64_unpadded() {
         // "hello" is 5 bytes → base64 "aGVsbG8=" with padding. The platform
         // sometimes drops the trailing `=`; we must still decode it.
-        let bytes = decode_data_url("data:application/octet-stream;base64,aGVsbG8").expect("decode");
+        let bytes =
+            decode_data_url("data:application/octet-stream;base64,aGVsbG8").expect("decode");
         assert_eq!(bytes, b"hello");
     }
 
@@ -1355,8 +1356,7 @@ mod tests {
     fn data_url_base64_url_safe_alphabet() {
         // 0xff 0xfe → standard "//4=", url-safe "__4" (unpadded). Exercises
         // both the `-_` alphabet and missing padding at once.
-        let bytes =
-            decode_data_url("data:application/octet-stream;base64,__4").expect("decode");
+        let bytes = decode_data_url("data:application/octet-stream;base64,__4").expect("decode");
         assert_eq!(bytes, &[0xff, 0xfe]);
     }
 
@@ -1424,7 +1424,10 @@ mod tests {
         let restarted = Status::default();
         assert!(!restarted.is_paused(), "default is running until bound");
         restarted.bind_pause_file(marker.clone());
-        assert!(restarted.is_paused(), "a persisted pause must survive a restart");
+        assert!(
+            restarted.is_paused(),
+            "a persisted pause must survive a restart"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
