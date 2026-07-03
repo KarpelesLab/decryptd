@@ -73,6 +73,14 @@ libloading = { version = "0.8", optional = true }
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
+# SIGUSR1 toggles the worker's pause/resume state — the only pause control on a
+# headless Unix box (no tray), and a scriptable one on the desktop (`kill -USR1`).
+# signal-hook delivers via a self-pipe to a normal handler thread, so the toggle
+# runs ordinary (non-async-signal-safe) code. Unix-only: Windows has no SIGUSR1
+# (its tray covers pausing), so the dep is never pulled into the Windows build.
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
+
 [features]
 # System-tray presence (version / status / GPUs / pause / updates / quit) layered
 # over the worker pipeline. On by default: ldtray degrades gracefully to headless,

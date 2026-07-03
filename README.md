@@ -118,6 +118,12 @@ The tray loads the desktop's toolkit at runtime, so there are **no GUI libraries
 to install**. If no tray host is available — a headless server, or `--once` —
 decryptd logs a notice and runs without a tray.
 
+On Unix (with or without a tray), **`kill -USR1 <pid>`** toggles Pause/Resume — the
+pause control for a headless worker, and scriptable on the desktop. The chosen
+state is remembered on disk (a `paused` marker in the working directory), so a
+paused worker stays paused across a restart — including an auto-update — instead of
+silently resuming work.
+
 ## Building from source
 
 You need a [Rust toolchain](https://rustup.rs) and a CUDA toolkit (only to link

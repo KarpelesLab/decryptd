@@ -533,6 +533,11 @@ struct Status {
     active: Arc<AtomicUsize>,
     /// Set by the tray's Pause item; the worker parks at its gates while true.
     paused: Arc<AtomicBool>,
+    /// On-disk marker (`<workdir>/paused`) mirroring `paused`, so a pause chosen in
+    /// the tray survives the auto-updater's restart instead of coming back running.
+    /// `None` until [`Status::bind_pause_file`] wires it up (e.g. the `--once` path
+    /// never persists); when `None`, pausing is purely in-memory.
+    paused_file: Arc<Mutex<Option<PathBuf>>>,
     /// Why the worker is idle when not running — "no open work", a pull error, or
     /// a fatal stop. Surfaced in the tray so a Windows user (whose console logs are
     /// swallowed by the GUI subsystem) can tell an idle worker from a broken one.
@@ -608,13 +613,44 @@ impl Status {
         self.paused.load(Ordering::Relaxed)
     }
 
-    /// Set/clear the pause flag. Only called by the GUI tray.
+    /// Set/clear the pause flag. Only called by the GUI tray. Also persists the
+    /// state to the on-disk marker (best-effort) when one is bound, so an
+    /// auto-update restart resumes in the same paused/running state the user chose.
     #[cfg_attr(
         not(all(feature = "gui", any(target_os = "linux", target_os = "windows"))),
         allow(dead_code)
     )]
     fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::Relaxed);
+        if let Some(path) = self.paused_file.lock().unwrap().as_ref() {
+            let res = if paused {
+                std::fs::write(path, b"")
+            } else {
+                match std::fs::remove_file(path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    other => other,
+                }
+            };
+            if let Err(e) = res {
+                eprintln!(
+                    "[decryptd] could not persist pause state to {}: {e}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// Bind the on-disk pause marker at `path` and adopt whatever state it records:
+    /// if the file exists we come up paused, matching what the user left running
+    /// before an auto-update restart. Called once at startup before the tray reads
+    /// the flag. Only the long-running worker binds this (`--once` skips it).
+    #[cfg_attr(
+        not(all(feature = "gui", any(target_os = "linux", target_os = "windows"))),
+        allow(dead_code)
+    )]
+    fn bind_pause_file(&self, path: PathBuf) {
+        self.paused.store(path.exists(), Ordering::Relaxed);
+        *self.paused_file.lock().unwrap() = Some(path);
     }
 
     /// Park the calling worker thread while paused (polled). Compiled into every
@@ -1078,8 +1114,50 @@ fn main() -> Result<()> {
 
     // Long-lived workers keep themselves current: check hourly in the background
     // and restart into each new signed build. `--once` is short-lived, so it skips
-    // the updater.
+    // the updater. This is also where the pause state is made durable: the tray can
+    // pause the worker, and without this an auto-update restart would resume running.
     if !args.once {
+        // Bind the on-disk pause marker before anything reads the flag, adopting the
+        // paused/running state a previous run (pre-restart) left behind. The workdir
+        // is created here too so the marker has somewhere to live (run_worker also
+        // creates it, idempotently). Bound wherever a pause control exists: any Unix
+        // build (the SIGUSR1 toggle below) and the Windows tray build. Windows-
+        // headless has no way to pause, so it neither adopts nor writes a marker.
+        #[cfg(any(unix, all(feature = "gui", target_os = "windows")))]
+        {
+            let workdir = args.workdir();
+            if let Err(e) = std::fs::create_dir_all(&workdir) {
+                eprintln!(
+                    "[decryptd] cannot prepare workdir {} for pause state: {e}",
+                    workdir.display()
+                );
+            }
+            status.bind_pause_file(workdir.join("paused"));
+        }
+
+        // On Unix, SIGUSR1 toggles pause/resume: the only pause control on a headless
+        // server, and a scriptable one on the desktop (`kill -USR1 <pid>`). The toggle
+        // goes through `set_paused`, so it persists to the marker just like the tray.
+        #[cfg(unix)]
+        {
+            let status = status.clone();
+            match signal_hook::iterator::Signals::new([signal_hook::consts::SIGUSR1]) {
+                Ok(mut signals) => {
+                    thread::spawn(move || {
+                        for _ in signals.forever() {
+                            let paused = !status.is_paused();
+                            status.set_paused(paused);
+                            eprintln!(
+                                "[decryptd] SIGUSR1: {}",
+                                if paused { "paused" } else { "resumed" }
+                            );
+                        }
+                    });
+                }
+                Err(e) => eprintln!("[decryptd] SIGUSR1 pause toggle unavailable: {e}"),
+            }
+        }
+
         match build_updater() {
             Ok(updater) => {
                 updater.spawn_auto_update(false);
@@ -1313,6 +1391,40 @@ mod tests {
         // A pinned (non-UUID) id is honored verbatim, trimmed of whitespace.
         std::fs::write(dir.join("worker-id"), "  my-pinned-id\n").unwrap();
         assert_eq!(load_or_create_worker_id(&dir).unwrap(), "my-pinned-id");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pause_state_survives_across_binds() {
+        let dir = std::env::temp_dir().join(format!("decryptd-pause-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("paused");
+
+        // A fresh worker with no marker comes up running, and toggling the flag off
+        // and on again leaves no stray file / writes the marker on demand.
+        let a = Status::default();
+        a.bind_pause_file(marker.clone());
+        assert!(!a.is_paused(), "no marker → running");
+        assert!(!marker.exists());
+
+        // Pausing writes the on-disk marker; resuming removes it.
+        a.set_paused(true);
+        assert!(marker.exists(), "pause must persist a marker");
+        a.set_paused(false);
+        assert!(!marker.exists(), "resume must clear the marker");
+        // Clearing an already-cleared state is a no-op, not an error.
+        a.set_paused(false);
+        assert!(!marker.exists());
+
+        // Pause, then simulate an auto-update restart: a brand-new Status binding the
+        // same file must adopt the paused state instead of resuming.
+        a.set_paused(true);
+        let restarted = Status::default();
+        assert!(!restarted.is_paused(), "default is running until bound");
+        restarted.bind_pause_file(marker.clone());
+        assert!(restarted.is_paused(), "a persisted pause must survive a restart");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
