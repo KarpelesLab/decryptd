@@ -745,7 +745,9 @@ fn claim_and_fetch(
         let mut map = inflight.lock().unwrap();
         if let Some(slot) = map.get_mut(&frag_id) {
             *slot = pull.response_key.clone();
-            eprintln!("[decryptd] GPU#{ordinal} fragment {frag_id} re-issued; refreshed key, backing off");
+            eprintln!(
+                "[decryptd] GPU#{ordinal} fragment {frag_id} re-issued; refreshed key, backing off"
+            );
             return Ok(None);
         }
         map.insert(frag_id.clone(), pull.response_key.clone());
@@ -943,7 +945,12 @@ fn round_ms(secs: f64) -> Value {
 
 /// Compress a finished fragment's records and submit them via `Decrypt/Job:submit`
 /// (the platform's standard upload / prepareCbCtx flow).
-fn submit_job(ctx: &RestContext, response_key: &str, job: &FinishedJob, queued: usize) -> Result<()> {
+fn submit_job(
+    ctx: &RestContext,
+    response_key: &str,
+    job: &FinishedJob,
+    queued: usize,
+) -> Result<()> {
     let records = job.output.len() / job.record_size.max(1) as usize;
     let packed = compcol::vec::compress_to_vec::<compcol::gzip::Gzip>(&job.output)
         .map_err(|e| anyhow!("gzip-compressing result: {e:?}"))?;
@@ -1009,7 +1016,10 @@ fn prefetch_loop(
                 }
             }
             Ok(None) => {
-                eprintln!("[decryptd] GPU#{ordinal} no work; sleeping {}s", args.idle_secs);
+                eprintln!(
+                    "[decryptd] GPU#{ordinal} no work; sleeping {}s",
+                    args.idle_secs
+                );
                 status.set_note("no open work");
                 thread::sleep(Duration::from_secs(args.idle_secs));
             }
@@ -1316,8 +1326,12 @@ fn run_worker(args: RunArgs, status: Status) -> Result<()> {
     // and used to flag when the GPUs are about to stall waiting on the upload pool.
     let pending: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
     for _ in 0..upload_slots {
-        let (ctx, inflight, done_rx, pending) =
-            (ctx.clone(), inflight.clone(), done_rx.clone(), pending.clone());
+        let (ctx, inflight, done_rx, pending) = (
+            ctx.clone(),
+            inflight.clone(),
+            done_rx.clone(),
+            pending.clone(),
+        );
         thread::spawn(move || upload_loop(ctx, inflight, done_rx, pending));
     }
 
@@ -1338,7 +1352,9 @@ fn run_worker(args: RunArgs, status: Status) -> Result<()> {
                 worker_id.clone(),
             );
             thread::spawn(move || {
-                prefetch_loop(ord, args, downloads, worker_id, ctx, inflight, ready_tx, status)
+                prefetch_loop(
+                    ord, args, downloads, worker_id, ctx, inflight, ready_tx, status,
+                )
             });
         }
         for _ in 0..jobs {
