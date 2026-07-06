@@ -16,7 +16,7 @@
 //!   3. reads launch parameters from `manifest.json` inside `engine.zip`, loads the
 //!      cubin for the local GPU, and launches its kernel over the fragment range
 //!      (the kernel does all the real work and writes output records),
-//!   4. gathers the output records, compresses them (xz), and submits them back with
+//!   4. gathers the output records, compresses them (gzip), and submits them back with
 //!      `Decrypt/Job:submit`.
 //!
 //! These stages are pipelined: the next fragment downloads while the GPU runs the
@@ -942,8 +942,8 @@ fn round_ms(secs: f64) -> Value {
 /// (the platform's standard upload / prepareCbCtx flow).
 fn submit_job(ctx: &RestContext, response_key: &str, job: &FinishedJob) -> Result<()> {
     let records = job.output.len() / job.record_size.max(1) as usize;
-    let packed = compcol::vec::compress_to_vec::<compcol::xz::Xz>(&job.output)
-        .map_err(|e| anyhow!("xz-compressing result: {e:?}"))?;
+    let packed = compcol::vec::compress_to_vec::<compcol::gzip::Gzip>(&job.output)
+        .map_err(|e| anyhow!("gzip-compressing result: {e:?}"))?;
     let packed_len = packed.len();
     let mut params: HashMap<String, Value> = HashMap::new();
     params.insert(
@@ -970,12 +970,12 @@ fn submit_job(ctx: &RestContext, response_key: &str, job: &FinishedJob) -> Resul
         "POST",
         params,
         Cursor::new(packed),
-        "application/x-xz",
+        "application/gzip",
         None,
     )
     .map_err(|e| anyhow!("Decrypt/Job:submit: {e}"))?;
     eprintln!(
-        "[decryptd] submitted {records} record(s) ({packed_len} B xz) for [{}, {}) (ran {:.1}s, dl {:.1}s)",
+        "[decryptd] submitted {records} record(s) ({packed_len} B gzip) for [{}, {}) (ran {:.1}s, dl {:.1}s)",
         job.start, job.end, job.run_secs, job.download_secs
     );
     Ok(())

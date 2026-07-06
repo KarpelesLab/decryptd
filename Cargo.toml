@@ -35,9 +35,9 @@ purecrypto = { version = "0.6.7", features = ["hazmat-secp256k1"] }
 # call failed with "bad response" (no console → invisible) — breaking pullOne and
 # self-update. 0.1.5 falls back to the embedded `cacrt` root bundle.
 rsurl = { version = "0.1.5", features = ["json"] }
-# In-house compression collection: xz for the result (out); the data blob (in)
-# is auto-detected via `factory::detect`, so enable the `factory` runtime
-# decoder lookup plus the container formats we can actually decode.
+# In-house compression collection: gzip for the result (out); the data blob (in)
+# is auto-detected via `factory::detect` (still xz or gzip), so enable the
+# `factory` runtime decoder lookup plus the container formats we can decode.
 # NOTE: only gzip + xz are enabled. compcol 0.6.6's bzip2 decoder fails on real
 # streams (UnexpectedEnd) and its zstd decoder rejects the content-checksum the
 # `zstd` CLI writes by default (Unsupported) — both verified against system-tool
