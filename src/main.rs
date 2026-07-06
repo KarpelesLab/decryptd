@@ -21,9 +21,11 @@
 //!
 //! These stages are pipelined: the next fragment downloads while the GPU runs the
 //! current one, and finished results upload while the GPU runs the next. Each GPU
-//! gets its own independent pipeline (prefetch → run → upload), and `--jobs` sets
-//! how many fragments run concurrently *on each* GPU; a shared in-flight set and
-//! blob-download map keep the GPUs from duplicating each other's work.
+//! gets its own prefetch→run pipeline; all of them feed a single shared pool of
+//! uploaders (a few more than there are runners) so a slow or rejected submit never
+//! stalls a GPU. `--jobs` sets how many fragments run concurrently *on each* GPU; a
+//! shared in-flight set and blob-download map keep the GPUs from duplicating each
+//! other's work.
 //!
 //! `pullOne`/`submit` and the `Decrypt/Data` blobs are anonymous-accessible, so a
 //! worker needs no credentials. All job-specific logic lives in the cubin + the data
@@ -1262,15 +1264,28 @@ fn run_worker(args: RunArgs, status: Status) -> Result<()> {
     let args = Arc::new(args);
     let mut runners = Vec::new();
 
-    // One independent pipeline per GPU: its own prefetch → bounded ready queue →
-    // `jobs` runners pinned to that GPU → `jobs` uploaders. Sharing `inflight`
-    // (dedupes a fragment the platform hands to two GPUs) and `downloads`
-    // (dedupes a blob two GPUs fetch into the shared cache).
+    // Shared upload stage across all GPUs: a pool of uploaders draining one queue,
+    // decoupled from the runners so a slow or failing submit never backpressures a
+    // GPU. Sized to a few more slots than there are runners, so even if every
+    // runner hands off at once *and* some uploads are slow (a big result upload, or
+    // a submit the platform rejects because the fragment was already solved
+    // elsewhere), there's always a free slot — the runner hands off and starts the
+    // next fragment instead of blocking the GPU.
+    let runner_count = gpus.len() * jobs;
+    let upload_slots = runner_count + 4;
+    let (done_tx, done_rx) = sync_channel::<FinishedJob>(upload_slots);
+    let done_rx = Arc::new(Mutex::new(done_rx));
+    for _ in 0..upload_slots {
+        let (ctx, inflight, done_rx) = (ctx.clone(), inflight.clone(), done_rx.clone());
+        thread::spawn(move || upload_loop(ctx, inflight, done_rx));
+    }
+
+    // One prefetch→ready→runner pipeline per GPU, all feeding the shared upload
+    // pool above. Sharing `inflight` (dedupes a fragment the platform hands to two
+    // GPUs) and `downloads` (dedupes a blob two GPUs fetch into the shared cache).
     for &ord in &gpus {
         let (ready_tx, ready_rx) = sync_channel::<ReadyJob>(jobs);
-        let (done_tx, done_rx) = sync_channel::<FinishedJob>(jobs);
         let ready_rx = Arc::new(Mutex::new(ready_rx));
-        let done_rx = Arc::new(Mutex::new(done_rx));
 
         {
             let (args, downloads, ctx, inflight, status, worker_id) = (
@@ -1286,10 +1301,6 @@ fn run_worker(args: RunArgs, status: Status) -> Result<()> {
             });
         }
         for _ in 0..jobs {
-            let (ctx, inflight, done_rx) = (ctx.clone(), inflight.clone(), done_rx.clone());
-            thread::spawn(move || upload_loop(ctx, inflight, done_rx));
-        }
-        for _ in 0..jobs {
             let (args, ready_rx, inflight, done_tx) = (
                 args.clone(),
                 ready_rx.clone(),
@@ -1301,8 +1312,9 @@ fn run_worker(args: RunArgs, status: Status) -> Result<()> {
                 run_loop(ord, args, ready_rx, inflight, done_tx, status)
             }));
         }
-        drop(done_tx);
     }
+    // Drop our own handle so the uploaders' `recv` ends once every runner exits.
+    drop(done_tx);
 
     // Runner threads loop forever; joining them blocks until the process is killed.
     for r in runners {
