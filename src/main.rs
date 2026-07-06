@@ -41,7 +41,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -713,6 +713,7 @@ impl Drop for RunGuard {
 /// was no work — either the platform had none, or it re-issued a fragment we're already
 /// processing (in which case the caller should just back off and retry).
 fn claim_and_fetch(
+    ordinal: i32,
     args: &RunArgs,
     downloads: &Downloads,
     worker_id: &str,
@@ -744,7 +745,7 @@ fn claim_and_fetch(
         let mut map = inflight.lock().unwrap();
         if let Some(slot) = map.get_mut(&frag_id) {
             *slot = pull.response_key.clone();
-            eprintln!("[decryptd] fragment {frag_id} re-issued; refreshed key, backing off");
+            eprintln!("[decryptd] GPU#{ordinal} fragment {frag_id} re-issued; refreshed key, backing off");
             return Ok(None);
         }
         map.insert(frag_id.clone(), pull.response_key.clone());
@@ -785,7 +786,7 @@ fn claim_and_fetch(
     match fetched {
         Ok(job) => {
             eprintln!(
-                "[decryptd] claimed [{start}, {end}) ({} items)",
+                "[decryptd] GPU#{ordinal} claimed [{start}, {end}) ({} items)",
                 end - start
             );
             Ok(Some(job))
@@ -917,7 +918,7 @@ fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJo
     let run_secs = t0.elapsed().as_secs_f64();
     let records = output.len() / job.manifest.record_size.max(1) as usize;
     eprintln!(
-        "[decryptd] ran [{}, {}): {records} record(s) in {run_secs:.1}s",
+        "[decryptd] GPU#{ordinal} ran [{}, {}): {records} record(s) in {run_secs:.1}s",
         job.start, job.end
     );
     Ok(FinishedJob {
@@ -942,7 +943,7 @@ fn round_ms(secs: f64) -> Value {
 
 /// Compress a finished fragment's records and submit them via `Decrypt/Job:submit`
 /// (the platform's standard upload / prepareCbCtx flow).
-fn submit_job(ctx: &RestContext, response_key: &str, job: &FinishedJob) -> Result<()> {
+fn submit_job(ctx: &RestContext, response_key: &str, job: &FinishedJob, queued: usize) -> Result<()> {
     let records = job.output.len() / job.record_size.max(1) as usize;
     let packed = compcol::vec::compress_to_vec::<compcol::gzip::Gzip>(&job.output)
         .map_err(|e| anyhow!("gzip-compressing result: {e:?}"))?;
@@ -977,8 +978,8 @@ fn submit_job(ctx: &RestContext, response_key: &str, job: &FinishedJob) -> Resul
     )
     .map_err(|e| anyhow!("Decrypt/Job:submit: {e}"))?;
     eprintln!(
-        "[decryptd] submitted {records} record(s) ({packed_len} B gzip) for [{}, {}) (ran {:.1}s, dl {:.1}s)",
-        job.start, job.end, job.run_secs, job.download_secs
+        "[decryptd] GPU#{} submitted {records} record(s) ({packed_len} B gzip) for [{}, {}) (ran {:.1}s, dl {:.1}s, {queued} upload(s) in flight)",
+        job.gpu_idx, job.start, job.end, job.run_secs, job.download_secs
     );
     Ok(())
 }
@@ -986,7 +987,9 @@ fn submit_job(ctx: &RestContext, response_key: &str, job: &FinishedJob) -> Resul
 // ---------------------------------------------------------------- pipeline stages
 /// Prefetch stage: keep pulling + downloading the next fragment so a ready job is
 /// waiting whenever the GPU frees up.
+#[allow(clippy::too_many_arguments)]
 fn prefetch_loop(
+    ordinal: i32,
     args: Arc<RunArgs>,
     downloads: Downloads,
     worker_id: String,
@@ -998,7 +1001,7 @@ fn prefetch_loop(
     loop {
         // Don't claim new work while paused.
         status.wait_while_paused();
-        match claim_and_fetch(&args, &downloads, &worker_id, &ctx, &inflight) {
+        match claim_and_fetch(ordinal, &args, &downloads, &worker_id, &ctx, &inflight) {
             Ok(Some(job)) => {
                 status.set_note(""); // got work; clear any idle note
                 if ready.send(job).is_err() {
@@ -1006,12 +1009,12 @@ fn prefetch_loop(
                 }
             }
             Ok(None) => {
-                eprintln!("[decryptd] no work; sleeping {}s", args.idle_secs);
+                eprintln!("[decryptd] GPU#{ordinal} no work; sleeping {}s", args.idle_secs);
                 status.set_note("no open work");
                 thread::sleep(Duration::from_secs(args.idle_secs));
             }
             Err(e) => {
-                eprintln!("[decryptd] pull error: {e:#}");
+                eprintln!("[decryptd] GPU#{ordinal} pull error: {e:#}");
                 status.set_note(format!("pull error: {e}"));
                 thread::sleep(Duration::from_secs(args.idle_secs));
             }
@@ -1027,6 +1030,7 @@ fn run_loop(
     ready: Arc<Mutex<Receiver<ReadyJob>>>,
     inflight: InFlight,
     done: SyncSender<FinishedJob>,
+    pending: Arc<AtomicUsize>,
     status: Status,
 ) {
     loop {
@@ -1041,13 +1045,35 @@ fn run_loop(
         let _running = status.run_guard();
         match run_on_gpu(ordinal, job, &status) {
             Ok(finished) => {
-                if done.send(finished).is_err() {
-                    inflight.lock().unwrap().remove(&frag_id);
-                    return;
+                // Hand the result to the shared upload pool. `pending` counts results
+                // produced but not yet uploaded; a full queue means every upload slot
+                // is busy, so this GPU is about to idle waiting to hand off — log it,
+                // since that's the exact condition the extra slots exist to prevent.
+                pending.fetch_add(1, Ordering::Relaxed);
+                match done.try_send(finished) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(finished)) => {
+                        eprintln!(
+                            "[decryptd] GPU#{ordinal} upload queue full ({} in flight); waiting to hand off [{}, {}) — GPU idle until a slot frees",
+                            pending.load(Ordering::Relaxed),
+                            finished.start,
+                            finished.end
+                        );
+                        if done.send(finished).is_err() {
+                            pending.fetch_sub(1, Ordering::Relaxed);
+                            inflight.lock().unwrap().remove(&frag_id);
+                            return;
+                        }
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        pending.fetch_sub(1, Ordering::Relaxed);
+                        inflight.lock().unwrap().remove(&frag_id);
+                        return;
+                    }
                 }
             }
             Err(e) => {
-                eprintln!("[decryptd] run error: {e:#}");
+                eprintln!("[decryptd] GPU#{ordinal} run error: {e:#}");
                 inflight.lock().unwrap().remove(&frag_id);
                 // Back off before taking the next fragment. Without this a
                 // persistent GPU fault (OOM, driver wedged, no compatible cubin)
@@ -1061,7 +1087,12 @@ fn run_loop(
 
 /// Upload stage: compress + submit finished results in the background while the GPU
 /// runs the next job.
-fn upload_loop(ctx: RestContext, inflight: InFlight, done: Arc<Mutex<Receiver<FinishedJob>>>) {
+fn upload_loop(
+    ctx: RestContext,
+    inflight: InFlight,
+    done: Arc<Mutex<Receiver<FinishedJob>>>,
+    pending: Arc<AtomicUsize>,
+) {
     loop {
         let job = match done.lock().unwrap().recv() {
             Ok(job) => job,
@@ -1070,20 +1101,26 @@ fn upload_loop(ctx: RestContext, inflight: InFlight, done: Arc<Mutex<Receiver<Fi
         // Read the latest key (the prefetcher may have refreshed it on a re-issue).
         let key = inflight.lock().unwrap().get(&job.frag_id).cloned();
         match key {
+            // `queued` is the current upload backlog (this result included), so the
+            // log shows whether uploads are keeping up with the GPUs.
             Some(key) => {
-                if let Err(e) = submit_job(&ctx, &key, &job) {
+                let queued = pending.load(Ordering::Relaxed);
+                if let Err(e) = submit_job(&ctx, &key, &job, queued) {
+                    // An "Access denied" here means the platform already has this
+                    // fragment (solved elsewhere): nothing to retry, just drop it.
                     eprintln!(
-                        "[decryptd] submit error for [{}, {}): {e:#}",
-                        job.start, job.end
+                        "[decryptd] GPU#{} submit error for [{}, {}): {e:#}",
+                        job.gpu_idx, job.start, job.end
                     );
                 }
             }
             None => eprintln!(
-                "[decryptd] no response key for fragment {}; dropping result",
-                job.frag_id
+                "[decryptd] GPU#{} no response key for fragment {}; dropping result",
+                job.gpu_idx, job.frag_id
             ),
         }
         inflight.lock().unwrap().remove(&job.frag_id);
+        pending.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1242,11 +1279,11 @@ fn run_worker(args: RunArgs, status: Status) -> Result<()> {
     if args.once {
         // Single fragment on the first selected GPU.
         let ord = gpus[0];
-        return match claim_and_fetch(&args, &downloads, &worker_id, &ctx, &inflight)? {
+        return match claim_and_fetch(ord, &args, &downloads, &worker_id, &ctx, &inflight)? {
             Some(job) => {
                 let key = inflight.lock().unwrap().get(&job.frag_id).cloned();
                 let key = key.ok_or_else(|| anyhow!("fragment lost its response key"))?;
-                submit_job(&ctx, &key, &run_on_gpu(ord, job, &status)?)
+                submit_job(&ctx, &key, &run_on_gpu(ord, job, &status)?, 0)
             }
             None => {
                 eprintln!("[decryptd] no work; exiting (--once)");
@@ -1275,9 +1312,13 @@ fn run_worker(args: RunArgs, status: Status) -> Result<()> {
     let upload_slots = runner_count + 4;
     let (done_tx, done_rx) = sync_channel::<FinishedJob>(upload_slots);
     let done_rx = Arc::new(Mutex::new(done_rx));
+    // Count of results produced but not yet uploaded — surfaced in the submit log
+    // and used to flag when the GPUs are about to stall waiting on the upload pool.
+    let pending: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
     for _ in 0..upload_slots {
-        let (ctx, inflight, done_rx) = (ctx.clone(), inflight.clone(), done_rx.clone());
-        thread::spawn(move || upload_loop(ctx, inflight, done_rx));
+        let (ctx, inflight, done_rx, pending) =
+            (ctx.clone(), inflight.clone(), done_rx.clone(), pending.clone());
+        thread::spawn(move || upload_loop(ctx, inflight, done_rx, pending));
     }
 
     // One prefetch→ready→runner pipeline per GPU, all feeding the shared upload
@@ -1297,19 +1338,20 @@ fn run_worker(args: RunArgs, status: Status) -> Result<()> {
                 worker_id.clone(),
             );
             thread::spawn(move || {
-                prefetch_loop(args, downloads, worker_id, ctx, inflight, ready_tx, status)
+                prefetch_loop(ord, args, downloads, worker_id, ctx, inflight, ready_tx, status)
             });
         }
         for _ in 0..jobs {
-            let (args, ready_rx, inflight, done_tx) = (
+            let (args, ready_rx, inflight, done_tx, pending) = (
                 args.clone(),
                 ready_rx.clone(),
                 inflight.clone(),
                 done_tx.clone(),
+                pending.clone(),
             );
             let status = status.clone();
             runners.push(thread::spawn(move || {
-                run_loop(ord, args, ready_rx, inflight, done_tx, status)
+                run_loop(ord, args, ready_rx, inflight, done_tx, pending, status)
             }));
         }
     }
