@@ -217,6 +217,30 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// A cheap random `u64` with no RNG-crate dependency: each `RandomState::new()`
+/// draws fresh, OS-seeded SipHash keys, so a hasher that has consumed no input
+/// already finalizes to a different value every call. Entropy quality here only
+/// needs to decorrelate retry timing, not be cryptographic.
+fn rand_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+}
+
+/// Spread a fixed backoff across a window so a fleet of workers that all hit the
+/// same event — a platform hiccup, or a shared no-work lull — don't retry in
+/// lockstep and stampede `pullOne` at the same instant. Returns a duration drawn
+/// uniformly from `[base*0.75, base*1.25]`, keeping the mean at `base`.
+fn jittered(base: Duration) -> Duration {
+    if base.is_zero() {
+        return base;
+    }
+    // Top 53 bits → a uniform f64 in [0, 1), then map onto [0.75, 1.25].
+    let frac = (rand_u64() >> 11) as f64 / (1u64 << 53) as f64;
+    base.mul_f64(0.75 + 0.5 * frac)
+}
+
 /// Parse a 64-char hex SHA-256 into raw bytes, or `None` if it isn't one.
 fn parse_sha256_hex(hex: &str) -> Option<[u8; 32]> {
     if hex.len() != 32 * 2 {
@@ -1021,12 +1045,12 @@ fn prefetch_loop(
                     args.idle_secs
                 );
                 status.set_note("no open work");
-                thread::sleep(Duration::from_secs(args.idle_secs));
+                thread::sleep(jittered(Duration::from_secs(args.idle_secs)));
             }
             Err(e) => {
                 eprintln!("[decryptd] GPU#{ordinal} pull error: {e:#}");
                 status.set_note(format!("pull error: {e}"));
-                thread::sleep(Duration::from_secs(args.idle_secs));
+                thread::sleep(jittered(Duration::from_secs(args.idle_secs)));
             }
         }
     }
@@ -1089,7 +1113,7 @@ fn run_loop(
                 // persistent GPU fault (OOM, driver wedged, no compatible cubin)
                 // spins here, claiming + downloading fragments as fast as the
                 // network allows and burning the work pool for nothing.
-                thread::sleep(Duration::from_secs(args.idle_secs));
+                thread::sleep(jittered(Duration::from_secs(args.idle_secs)));
             }
         }
     }
@@ -1575,6 +1599,26 @@ mod tests {
         assert!(select_gpus(&Some("3".into()), 2).is_err());
         assert!(select_gpus(&Some("x".into()), 2).is_err());
         assert!(select_gpus(&Some("".into()), 2).is_err());
+    }
+
+    #[test]
+    fn jittered_stays_in_window_and_actually_varies() {
+        let base = Duration::from_secs(60);
+        let (lo, hi) = (base.mul_f64(0.75), base.mul_f64(1.25));
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let d = jittered(base);
+            assert!(d >= lo && d <= hi, "jitter {d:?} outside [{lo:?}, {hi:?}]");
+            seen.insert(d.as_nanos());
+        }
+        // The whole point is decorrelation, so the draws must genuinely differ.
+        assert!(
+            seen.len() > 100,
+            "jitter barely varies: {} distinct values",
+            seen.len()
+        );
+        // A zero base has nothing to spread and must not divide by zero.
+        assert_eq!(jittered(Duration::ZERO), Duration::ZERO);
     }
 
     #[test]
