@@ -200,7 +200,7 @@ fn d_entry() -> String {
     "decrypt".into()
 }
 fn d_out_cap() -> u32 {
-    1 << 20
+    1 << 24
 }
 fn d_block() -> u32 {
     256
