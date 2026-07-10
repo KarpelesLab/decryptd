@@ -303,6 +303,16 @@ impl Drop for Gpu {
 /// runaway job can't pin a GPU forever. The bound is per-tile-granular — a single
 /// tile already in flight runs to completion (a blocking `cuCtxSynchronize` can't be
 /// interrupted), so keep tiles small enough that one tile is well under the limit.
+///
+/// `out_cap` bounds only the *on-device* output buffer (one launch's matches), not
+/// the job's total result count: the buffer is drained after every launch. The
+/// per-launch item count adapts to the observed match density to keep each launch
+/// filling ~7/8 of the buffer, so a match-dense range is processed in small
+/// self-calibrated launches rather than overflowing. An overflowing launch is
+/// recomputed at the corrected size (its work is redone, but the density estimate
+/// makes overflow rare — typically once, to calibrate); no result is ever dropped
+/// and the buffer stays sized to one launch regardless of total matches. A single
+/// item that alone overflows `out_cap` is a hard error (the cap is too small).
 #[allow(clippy::too_many_arguments)]
 pub fn run_job(
     gpu: &Gpu,
@@ -343,6 +353,13 @@ pub fn run_job(
     // (a paused worker must not time out). Checked once per tile below.
     let started = Instant::now();
     let mut paused = Duration::ZERO;
+    // Items per launch, adapted to the observed match density so each launch fills
+    // — but does not overflow — the `out_cap` output buffer. It persists across
+    // positions: a dense region stays calibrated to a small size instead of
+    // resetting to a full tile and re-overflowing (and re-computing) every step.
+    // Starts optimistic at a full tile; the first launch of a dense job overflows
+    // once to calibrate, then it settles (see the re-estimate below).
+    let mut launch = tile;
     while cur <= end_incl {
         let park = Instant::now();
         gate(); // park here while paused (no kernel launched until resumed)
@@ -355,7 +372,8 @@ pub fn run_job(
                 timeout.as_secs_f64(),
             ));
         }
-        let count = ((end_incl - cur).saturating_add(1)).min(tile);
+
+        let count = ((end_incl - cur).saturating_add(1)).min(launch).max(1);
         d_count.memset0()?;
         let (mut a_start, mut a_count) = (cur, count);
         let (mut a_data, mut a_dlen) = (d_data.ptr, data.len() as u64);
@@ -395,11 +413,40 @@ pub fn run_job(
         )?;
         check(unsafe { cuCtxSynchronize() }, "cuCtxSynchronize")?;
 
+        // The kernel's counter reflects *every* match, including those past `out_cap`
+        // it couldn't write. Treat it as a density sample and re-estimate `launch`
+        // for next time to target ~7/8 of `out_cap` — enough headroom that ordinary
+        // density variance doesn't tip the following launch into overflow. This is a
+        // one-step controller with a stable fixed point at 7/8 fill: `raw == 0` (a
+        // sparse region) yields a huge estimate, clamped back up to a full tile.
         let mut cb = [0u8; 4];
         d_count.dtoh(&mut cb)?;
-        let n = u32::from_le_bytes(cb).min(out_cap);
-        if n > 0 {
-            let mut recs = vec![0u8; n as usize * record_size as usize];
+        let raw = u32::from_le_bytes(cb);
+        let est = (count as u128 * out_cap as u128 * 7 / 8 / raw.max(1) as u128) as u64;
+        launch = est.clamp(1, tile);
+
+        if raw > out_cap {
+            // Overflow: the buffer holds an arbitrary `out_cap`-sized subset of the
+            // matches (whichever threads won the atomic race), so it's unusable.
+            // Recompute this same position at the smaller re-estimated size — nothing
+            // is dropped, at the cost of redoing this one launch. A single item that
+            // still overflows means `out_cap` is genuinely too small for the job.
+            if count <= 1 {
+                return Err(format!(
+                    "out_cap {out_cap} too small: item {cur} alone produced \
+                     more than {out_cap} records"
+                ));
+            }
+            // The estimate is already < count whenever raw > out_cap; this guards the
+            // integer-rounding corner so a retry always makes progress.
+            if launch >= count {
+                launch = count / 2;
+            }
+            continue; // do not advance `cur`/`done`
+        }
+
+        if raw > 0 {
+            let mut recs = vec![0u8; raw as usize * record_size as usize];
             // Read only the populated prefix of the output buffer.
             let mut tmp = DeviceBufView {
                 ptr: d_out.ptr,
@@ -411,9 +458,6 @@ pub fn run_job(
         done += count;
         progress(done.min(total), total);
         cur = cur.saturating_add(count);
-        if count == 0 {
-            break;
-        }
     }
     Ok(results)
 }
@@ -460,5 +504,57 @@ mod tests {
             let _ = gpu.compute_capability();
             drop(gpu);
         }
+    }
+
+    /// Verifies the density-adaptive overflow path: with an `out_cap` far smaller
+    /// than a launch's match count, `run_job` must still return *every* record by
+    /// recomputing at the corrected size — none silently dropped, none duplicated.
+    ///
+    /// Needs a real GPU and a companion `emit` cubin implementing the kernel ABI so
+    /// that it emits K records per item — K read from the first 4 bytes of the blob,
+    /// each record being [(u32) item, (u32) ordinal]. Run manually:
+    ///   DECRYPTD_TEST_CUBIN=/path/to/emit.sm120.cubin \
+    ///     cargo test --release -- --ignored out_cap_overflow
+    #[test]
+    #[ignore]
+    fn out_cap_overflow_recovers_all_records() {
+        let Ok(path) = std::env::var("DECRYPTD_TEST_CUBIN") else {
+            panic!("set DECRYPTD_TEST_CUBIN to the emit cubin matching this GPU");
+        };
+        let bytes = std::fs::read(&path).expect("read cubin");
+        let cubins = vec![(0u32, bytes)];
+        let gpu = Gpu::load_first(0, &cubins).expect("load_first");
+
+        const N: u64 = 10_000; // items
+        const K: u32 = 7; // records emitted per item
+        let data = K.to_le_bytes().to_vec();
+        let expected = N as usize * K as usize;
+
+        let out = run_job(
+            &gpu,
+            "emit",
+            &data,
+            0,
+            N - 1,
+            8,       // record_size: [u32 item, u32 ordinal]
+            1000,    // out_cap: deliberately << N*K, forcing many subdivisions
+            128,     // block
+            1 << 20, // tile: whole range fits one tile, so the first launch overflows
+            Duration::from_secs(60),
+            |_, _| {},
+            || {},
+        )
+        .expect("run_job");
+
+        assert_eq!(out.len(), expected * 8, "byte length mismatch");
+        let mut seen = std::collections::HashSet::new();
+        for rec in out.chunks_exact(8) {
+            let item = u32::from_le_bytes(rec[0..4].try_into().unwrap());
+            let ord = u32::from_le_bytes(rec[4..8].try_into().unwrap());
+            assert!((item as u64) < N, "item {item} out of range");
+            assert!(ord < K, "ordinal {ord} out of range");
+            assert!(seen.insert((item, ord)), "duplicate record ({item},{ord})");
+        }
+        assert_eq!(seen.len(), expected, "missing records after subdivision");
     }
 }
