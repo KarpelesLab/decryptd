@@ -2,17 +2,21 @@
 //! nothing about the kernel's job — it uploads an opaque data blob, launches a
 //! kernel with the fixed ABI below over a range, and reads back the output records.
 //!
-//! Kernel ABI (the contract every decryptd cubin entry point implements):
+//! Kernel ABI v3 (the contract every current decryptd cubin implements; the full
+//! spec is CKF's `api.md`):
 //! ```c
 //! extern "C" __global__ void <entry>(
-//!     unsigned long long start,    // first work-item index
+//!     unsigned long long* start,   // in/out: [base, resume] cell, 2 x u64
 //!     unsigned long long count,    // items in this launch
 //!     const unsigned char* data,   // the opaque job data blob (device)
 //!     unsigned long long data_len,
-//!     unsigned char* out,          // output record buffer (device)
-//!     unsigned int* out_count,     // atomically-incremented record counter
-//!     unsigned int out_cap);       // capacity in records
+//!     unsigned char* out,          // output byte-stream buffer (device)
+//!     unsigned int* out_count,     // atomic BYTE cursor
+//!     unsigned int out_cap);       // capacity in BYTES
 //! ```
+//! The pre-v3 ABI — `start` passed by value, `out_count`/`out_cap` counted in
+//! fixed-size records — is still supported for jobs already dispatched against it
+//! (api.md §6). The manifest's `format` field selects between them; see [`Abi`].
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr;
@@ -106,6 +110,18 @@ impl DeviceBuf {
         }
         Ok(b)
     }
+    fn htod(&self, src: &[u8]) -> Result<(), String> {
+        check(
+            unsafe {
+                cuMemcpyHtoD_v2(
+                    self.ptr,
+                    src.as_ptr() as *const c_void,
+                    src.len().min(self.len),
+                )
+            },
+            "cuMemcpyHtoD",
+        )
+    }
     fn memset0(&self) -> Result<(), String> {
         check(
             unsafe { cuMemsetD8_v2(self.ptr, 0, self.len) },
@@ -123,6 +139,70 @@ impl Drop for DeviceBuf {
     fn drop(&mut self) {
         unsafe { cuMemFree_v2(self.ptr) };
     }
+}
+
+/// Which kernel ABI a job's cubins implement, selected by the manifest's `format`
+/// (api.md §5). The two differ in how `start` is passed, what `out_count`/`out_cap`
+/// count, and how the output buffer is framed — see the module docs.
+#[derive(Clone, Copy, Debug)]
+pub enum Abi {
+    /// Pre-v3 (`format` absent or `< 3`): `start` by value, `out_count`/`out_cap` in
+    /// records, output a flat array of fixed-size records. Kept so a worker never
+    /// chokes on jobs dispatched before v3 (api.md §6).
+    Legacy { record_size: u32 },
+    /// v3 (`format == 3`): `start` points at a `[base, resume]` cell,
+    /// `out_count`/`out_cap` are byte counts, output is a self-delimiting stream of
+    /// `uleb128(len) ‖ payload` records. decryptd never parses a payload — it only
+    /// walks the length prefixes to find where the stream ends.
+    V3,
+}
+
+/// Length of the valid prefix of a v3 framed stream (api.md §3): walks
+/// `uleb128(len) ‖ payload` records and stops at the terminating zero-length record
+/// (the zero-filled tail), at a truncated varint, or at a record that would run past
+/// the written region. Trimming each launch's stream to this length lets the
+/// per-launch streams be concatenated into one continuous stream for the consumer.
+fn framed_len(buf: &[u8]) -> usize {
+    walk_framed(buf).0
+}
+
+/// Number of records in a v3 framed stream — the count decryptd reports in its logs
+/// and submit telemetry (it never looks inside a payload).
+pub fn count_framed_records(buf: &[u8]) -> usize {
+    walk_framed(buf).1
+}
+
+/// Shared walk: returns `(valid byte length, record count)`.
+fn walk_framed(buf: &[u8]) -> (usize, usize) {
+    let (mut off, mut n) = (0usize, 0usize);
+    while off < buf.len() {
+        // Decode the uleb128 length prefix.
+        let (mut len, mut shift, mut i) = (0u64, 0u32, off);
+        loop {
+            let Some(&b) = buf.get(i) else {
+                return (off, n);
+            }; // truncated varint
+            i += 1;
+            len |= u64::from(b & 0x7f) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift > 63 {
+                return (off, n); // malformed — stop at the last good record
+            }
+        }
+        if len == 0 {
+            return (off, n); // zero-length record terminates the stream
+        }
+        match i.checked_add(len as usize) {
+            Some(end) if end <= buf.len() => off = end,
+            // A record that overruns the written region: the buffer filled here.
+            _ => return (off, n),
+        }
+        n += 1;
+    }
+    (off, n)
 }
 
 /// Number of CUDA devices visible to the driver (after `CUDA_VISIBLE_DEVICES`).
@@ -305,14 +385,21 @@ impl Drop for Gpu {
 /// interrupted), so keep tiles small enough that one tile is well under the limit.
 ///
 /// `out_cap` bounds only the *on-device* output buffer (one launch's matches), not
-/// the job's total result count: the buffer is drained after every launch. The
-/// per-launch item count adapts to the observed match density to keep each launch
-/// filling ~7/8 of the buffer, so a match-dense range is processed in small
-/// self-calibrated launches rather than overflowing. An overflowing launch is
-/// recomputed at the corrected size (its work is redone, but the density estimate
-/// makes overflow rare — typically once, to calibrate); no result is ever dropped
-/// and the buffer stays sized to one launch regardless of total matches. A single
-/// item that alone overflows `out_cap` is a hard error (the cap is too small).
+/// the job's total result count: the buffer is drained after every launch. It counts
+/// records under [`Abi::Legacy`] and bytes under [`Abi::V3`]. Either way, under-sizing
+/// it is safe — no result is ever dropped — but the two ABIs recover differently:
+///
+/// * **v3** uses the kernel's resume watermark (api.md §4). A launch whose buffer
+///   fills reports the lowest work-index it could not record; everything below that
+///   is complete, so the next launch simply restarts there. No work is redone.
+/// * **legacy** has no watermark, so an overflowing launch's buffer holds an arbitrary
+///   subset (whichever threads won the atomic race) and is unusable. The per-launch
+///   item count adapts to the observed match density, targeting ~7/8 fill, and an
+///   overflowing launch is recomputed at the corrected size — its work is redone, but
+///   the density estimate makes overflow rare (typically once, to calibrate).
+///
+/// Under either ABI, a single item that alone overflows `out_cap` is a hard error
+/// (the cap is too small for the job).
 #[allow(clippy::too_many_arguments)]
 pub fn run_job(
     gpu: &Gpu,
@@ -320,7 +407,7 @@ pub fn run_job(
     data: &[u8],
     start: u64,
     end_incl: u64,
-    record_size: u32,
+    abi: Abi,
     out_cap: u32,
     block: u32,
     tile: u64,
@@ -331,18 +418,35 @@ pub fn run_job(
     // Validate the publisher-supplied launch params up front: a bad manifest is a
     // handled error, never a panic (a panic here unwinds the runner thread and
     // takes the whole daemon down). `block == 0` would divide-by-zero below;
-    // `record_size == 0` makes the output layout meaningless.
+    // a zero cap or `record_size` makes the output layout meaningless.
     if block == 0 {
         return Err("manifest block size is 0".into());
     }
-    if record_size == 0 {
-        return Err("manifest record_size is 0".into());
+    if out_cap == 0 {
+        return Err("manifest out_cap is 0".into());
     }
+    // Bytes of output buffer per unit of `out_cap`: v3 counts bytes directly, legacy
+    // counts fixed-size records.
+    let cap_unit = match abi {
+        Abi::Legacy { record_size } => {
+            if record_size == 0 {
+                return Err("manifest record_size is 0".into());
+            }
+            record_size as usize
+        }
+        Abi::V3 => 1,
+    };
 
     let func = gpu.function(entry)?;
     let d_data = DeviceBuf::from_slice(data)?;
-    let d_out = DeviceBuf::alloc(record_size as usize * out_cap as usize)?;
+    let d_out = DeviceBuf::alloc(cap_unit * out_cap as usize)?;
     let d_count = DeviceBuf::alloc(4)?;
+    // v3 only: the `[base, resume]` cell that `start` points at. Its presence is also
+    // what marks this run as v3 below.
+    let d_start = match abi {
+        Abi::V3 => Some(DeviceBuf::alloc(16)?),
+        Abi::Legacy { .. } => None,
+    };
 
     let total = end_incl.saturating_sub(start).saturating_add(1);
     let tile = tile.max(1);
@@ -353,12 +457,13 @@ pub fn run_job(
     // (a paused worker must not time out). Checked once per tile below.
     let started = Instant::now();
     let mut paused = Duration::ZERO;
-    // Items per launch, adapted to the observed match density so each launch fills
-    // — but does not overflow — the `out_cap` output buffer. It persists across
-    // positions: a dense region stays calibrated to a small size instead of
-    // resetting to a full tile and re-overflowing (and re-computing) every step.
-    // Starts optimistic at a full tile; the first launch of a dense job overflows
-    // once to calibrate, then it settles (see the re-estimate below).
+    // Items per launch. Under v3 this stays a full tile: a launch that fills the
+    // buffer still counts, because the resume watermark says where to pick up, so
+    // there is nothing to calibrate. Under legacy it adapts to the observed match
+    // density so each launch fills — but does not overflow — the `out_cap` buffer,
+    // and it persists across positions: a dense region stays calibrated to a small
+    // size instead of resetting to a full tile and re-overflowing (and re-computing)
+    // every step. Either way it starts optimistic at a full tile.
     let mut launch = tile;
     while cur <= end_incl {
         let park = Instant::now();
@@ -375,7 +480,23 @@ pub fn run_job(
 
         let count = ((end_incl - cur).saturating_add(1)).min(launch).max(1);
         d_count.memset0()?;
-        let (mut a_start, mut a_count) = (cur, count);
+        if let Some(ds) = &d_start {
+            // v3: zero the output buffer — the zero tail *is* the stream terminator,
+            // and it also masks the previous launch's bytes past an overflow point —
+            // and init the cell to `[base, base+count]`, i.e. "ran to the end".
+            d_out.memset0()?;
+            let mut cell = [0u8; 16];
+            cell[..8].copy_from_slice(&cur.to_le_bytes());
+            cell[8..].copy_from_slice(&cur.saturating_add(count).to_le_bytes());
+            ds.htod(&cell)?;
+        }
+        // v3 passes a device pointer to the `[base, resume]` cell; legacy passes the
+        // base index by value. Both are one u64-sized argument slot.
+        let mut a_start = match &d_start {
+            Some(ds) => ds.ptr,
+            None => cur,
+        };
+        let mut a_count = count;
         let (mut a_data, mut a_dlen) = (d_data.ptr, data.len() as u64);
         let (mut a_out, mut a_oc, mut a_cap) = (d_out.ptr, d_count.ptr, out_cap);
         let mut params: [*mut c_void; 7] = [
@@ -413,15 +534,68 @@ pub fn run_job(
         )?;
         check(unsafe { cuCtxSynchronize() }, "cuCtxSynchronize")?;
 
+        let mut cb = [0u8; 4];
+        d_count.dtoh(&mut cb)?;
+        let raw = u32::from_le_bytes(cb);
+
+        if let Some(ds) = &d_start {
+            // ---- v3: the resume watermark says exactly how far this launch got.
+            let mut cell = [0u8; 16];
+            ds.dtoh(&mut cell)?;
+            let resume = u64::from_le_bytes(cell[8..].try_into().unwrap());
+            let end_x = cur.saturating_add(count);
+            // Clamp: a kernel that leaves the cell untouched (or writes nonsense)
+            // must not rewind the range or skip past its end.
+            let next = resume.clamp(cur, end_x);
+            if next == cur {
+                // The buffer filled before item `cur` itself could be recorded, so
+                // this launch made no progress. Retry the same position with fewer
+                // items — a fresh, empty buffer usually clears it. If a single item
+                // still can't fit, `out_cap` is genuinely too small for this job.
+                if count <= 1 {
+                    return Err(format!(
+                        "out_cap {out_cap} bytes too small: item {cur} alone \
+                         overflows the output buffer"
+                    ));
+                }
+                launch = count / 2;
+                continue; // do not advance `cur`/`done`
+            }
+            // `raw` is the byte cursor, which overshoots `out_cap` when the buffer
+            // filled; the framing walk finds the true end of the written prefix.
+            //
+            // Everything below the watermark is complete, so we keep the whole prefix
+            // and restart at `next`. Threads race, so a filled buffer can also hold
+            // records for work-indices at or above the watermark, and re-running from
+            // it emits those a second time. That's inherent to the ABI (api.md §4
+            // prescribes exactly this loop) and decryptd can't dedup — it doesn't know
+            // the payload layout, so it can't tell which index a record belongs to.
+            // The consumer tolerates a repeated record; a dropped one it could not.
+            let written = (raw as usize).min(out_cap as usize);
+            if written > 0 {
+                let mut buf = vec![0u8; written];
+                DeviceBufView {
+                    ptr: d_out.ptr,
+                    len: written,
+                }
+                .dtoh(&mut buf)?;
+                buf.truncate(framed_len(&buf));
+                results.extend_from_slice(&buf);
+            }
+            launch = tile; // undo any shrink from a no-progress retry
+            done += next - cur;
+            progress(done.min(total), total);
+            cur = next;
+            continue;
+        }
+
+        // ---- legacy (pre-v3): no watermark, so infer from the record counter.
         // The kernel's counter reflects *every* match, including those past `out_cap`
         // it couldn't write. Treat it as a density sample and re-estimate `launch`
         // for next time to target ~7/8 of `out_cap` — enough headroom that ordinary
         // density variance doesn't tip the following launch into overflow. This is a
         // one-step controller with a stable fixed point at 7/8 fill: `raw == 0` (a
         // sparse region) yields a huge estimate, clamped back up to a full tile.
-        let mut cb = [0u8; 4];
-        d_count.dtoh(&mut cb)?;
-        let raw = u32::from_le_bytes(cb);
         let est = (count as u128 * out_cap as u128 * 7 / 8 / raw.max(1) as u128) as u64;
         launch = est.clamp(1, tile);
 
@@ -446,7 +620,7 @@ pub fn run_job(
         }
 
         if raw > 0 {
-            let mut recs = vec![0u8; raw as usize * record_size as usize];
+            let mut recs = vec![0u8; raw as usize * cap_unit];
             // Read only the populated prefix of the output buffer.
             let mut tmp = DeviceBufView {
                 ptr: d_out.ptr,
@@ -506,6 +680,76 @@ mod tests {
         }
     }
 
+    /// Frame a v3 payload the way a kernel's `ckf_out_record` does.
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        let (mut v, mut len) = (Vec::new(), payload.len() as u64);
+        while len >= 0x80 {
+            v.push((len as u8 & 0x7f) | 0x80);
+            len >>= 7;
+        }
+        v.push(len as u8);
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// The v3 stream walk (api.md §3) must find the exact end of the written region
+    /// so per-launch streams concatenate cleanly: it stops at the zero-length record
+    /// that the zero-filled tail forms, and never reads into the untouched remainder.
+    #[test]
+    fn framed_walk_stops_at_zero_terminator() {
+        let mut buf = Vec::new();
+        for i in 0u64..3 {
+            buf.extend_from_slice(&frame(&i.to_le_bytes())); // cracker payload: u64 index
+        }
+        let used = buf.len();
+        assert_eq!(used, 3 * 9, "uleb128(8) + 8 bytes per record");
+        buf.resize(used + 512, 0); // the zero-filled tail of the output buffer
+        assert_eq!(framed_len(&buf), used);
+        assert_eq!(count_framed_records(&buf), 3);
+        // Trimming to `framed_len` is what makes concatenation valid.
+        let mut joined = buf[..framed_len(&buf)].to_vec();
+        joined.extend_from_slice(&buf[..framed_len(&buf)]);
+        assert_eq!(count_framed_records(&joined), 6);
+    }
+
+    /// A multi-byte length prefix (payload >= 128 bytes) must decode as standard
+    /// unsigned LEB128, not be mistaken for two records.
+    #[test]
+    fn framed_walk_handles_multibyte_lengths() {
+        let big = vec![0xabu8; 300];
+        let buf = frame(&big);
+        assert_eq!(buf[0..2], [0xac, 0x02], "uleb128(300)");
+        assert_eq!(framed_len(&buf), buf.len());
+        assert_eq!(count_framed_records(&buf), 1);
+    }
+
+    /// When a launch overflows, the byte cursor overshoots and the last record is cut
+    /// off mid-payload (or mid-varint). The walk must drop that partial record rather
+    /// than emit a corrupt one — the resume watermark re-runs it next launch.
+    #[test]
+    fn framed_walk_drops_a_truncated_tail_record() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&frame(&7u64.to_le_bytes()));
+        let complete = buf.len();
+        buf.extend_from_slice(&frame(&9u64.to_le_bytes()));
+        for cut in 1..=8 {
+            let partial = &buf[..buf.len() - cut]; // payload cut short
+            assert_eq!(framed_len(partial), complete, "cut {cut}");
+            assert_eq!(count_framed_records(partial), 1, "cut {cut}");
+        }
+        // Cut so only the second record's length prefix survives, then nothing at all.
+        assert_eq!(framed_len(&buf[..complete + 1]), complete);
+        assert_eq!(framed_len(&buf[..complete]), complete);
+    }
+
+    /// An unterminated varint (high bit set forever) must not loop or over-read.
+    #[test]
+    fn framed_walk_rejects_a_malformed_varint() {
+        let buf = vec![0xffu8; 32];
+        assert_eq!(framed_len(&buf), 0);
+        assert_eq!(count_framed_records(&buf), 0);
+    }
+
     /// Verifies the density-adaptive overflow path: with an `out_cap` far smaller
     /// than a launch's match count, `run_job` must still return *every* record by
     /// recomputing at the corrected size — none silently dropped, none duplicated.
@@ -536,7 +780,7 @@ mod tests {
             &data,
             0,
             N - 1,
-            8,       // record_size: [u32 item, u32 ordinal]
+            Abi::Legacy { record_size: 8 }, // [u32 item, u32 ordinal]
             1000,    // out_cap: deliberately << N*K, forcing many subdivisions
             128,     // block
             1 << 20, // tile: whole range fits one tile, so the first launch overflows

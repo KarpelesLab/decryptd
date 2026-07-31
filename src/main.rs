@@ -185,8 +185,10 @@ struct Manifest {
     #[serde(default = "d_entry")]
     entry: String,
     /// Output record size in bytes (e.g. 28 = u64 seed + 20-byte address).
+    /// **Pre-v3 only** — a v3 stream is self-delimiting, so v3 manifests omit it.
+    #[serde(default)]
     record_size: u32,
-    /// Output buffer capacity in records.
+    /// Output buffer capacity — in *bytes* under v3, in *records* pre-v3.
     #[serde(default = "d_out_cap")]
     out_cap: u32,
     /// CUDA block size.
@@ -195,6 +197,32 @@ struct Manifest {
     /// Work-items per kernel launch (tiles a large range).
     #[serde(default = "d_tile")]
     tile: u64,
+    /// Output format version: `3` selects the v3 kernel ABI; absent or `< 3` selects
+    /// the legacy fixed-record ABI (CKF api.md §5/§6).
+    #[serde(default)]
+    format: u32,
+}
+
+impl Manifest {
+    /// Which kernel ABI this job's cubins implement.
+    fn abi(&self) -> cuda::Abi {
+        if self.format >= 3 {
+            cuda::Abi::V3
+        } else {
+            cuda::Abi::Legacy {
+                record_size: self.record_size,
+            }
+        }
+    }
+
+    /// Number of output records in a finished fragment's buffer — for logs and submit
+    /// telemetry only; decryptd never interprets a record's contents.
+    fn count_records(&self, output: &[u8]) -> usize {
+        match self.abi() {
+            cuda::Abi::V3 => cuda::count_framed_records(output),
+            cuda::Abi::Legacy { record_size } => output.len() / record_size.max(1) as usize,
+        }
+    }
 }
 fn d_entry() -> String {
     "decrypt".into()
@@ -522,7 +550,8 @@ struct FinishedJob {
     frag_id: String,
     start: u64,
     end: u64,
-    record_size: u32,
+    /// Output records the fragment produced (counted per its ABI) — reported in logs.
+    records: usize,
     output: Vec<u8>,
     /// Seconds the GPU spent on this fragment.
     run_secs: f64,
@@ -912,8 +941,11 @@ fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJo
     let cubin_arch = gpu.cubin_arch();
     let gpu_name = gpu.device_name();
     eprintln!(
-        "[decryptd] running [{}, {}) on GPU#{ordinal} {gpu_name} (sm_{maj}{min}, cubin sm{cubin_arch}): entry={}",
-        job.start, job.end, job.manifest.entry,
+        "[decryptd] running [{}, {}) on GPU#{ordinal} {gpu_name} (sm_{maj}{min}, cubin sm{cubin_arch}): entry={} abi={:?}",
+        job.start,
+        job.end,
+        job.manifest.entry,
+        job.manifest.abi(),
     );
     let t0 = Instant::now();
     let output = cuda::run_job(
@@ -922,7 +954,7 @@ fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJo
         &job.data,
         job.start,
         job.end - 1, // run_job's range is inclusive
-        job.manifest.record_size,
+        job.manifest.abi(),
         job.manifest.out_cap,
         job.manifest.block,
         job.manifest.tile,
@@ -942,7 +974,7 @@ fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJo
     )
     .map_err(|e| anyhow!("run_job: {e}"))?;
     let run_secs = t0.elapsed().as_secs_f64();
-    let records = output.len() / job.manifest.record_size.max(1) as usize;
+    let records = job.manifest.count_records(&output);
     eprintln!(
         "[decryptd] GPU#{ordinal} ran [{}, {}): {records} record(s) in {run_secs:.1}s",
         job.start, job.end
@@ -951,7 +983,7 @@ fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJo
         frag_id: job.frag_id,
         start: job.start,
         end: job.end,
-        record_size: job.manifest.record_size,
+        records,
         output,
         run_secs,
         download_secs: job.download_secs,
@@ -975,7 +1007,7 @@ fn submit_job(
     job: &FinishedJob,
     queued: usize,
 ) -> Result<()> {
-    let records = job.output.len() / job.record_size.max(1) as usize;
+    let records = job.records;
     let packed = compcol::vec::compress_to_vec::<compcol::gzip::Gzip>(&job.output)
         .map_err(|e| anyhow!("gzip-compressing result: {e:?}"))?;
     let packed_len = packed.len();
@@ -1408,6 +1440,41 @@ fn run_worker(args: RunArgs, status: Status) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A v3 manifest carries `format: 3` and **no** `record_size` (the stream is
+    /// self-delimiting). Parsing must accept that and select the v3 ABI — before v3
+    /// support, `record_size` was a required field and such a manifest failed to
+    /// parse, failing every fragment of the job.
+    #[test]
+    fn v3_manifest_parses_without_record_size() {
+        let m: Manifest =
+            serde_json::from_str(r#"{"entry":"decrypt","out_cap":1048576,"format":3}"#)
+                .expect("v3 manifest must parse without record_size");
+        assert!(matches!(m.abi(), cuda::Abi::V3));
+        assert_eq!(m.out_cap, 1048576, "v3 out_cap is a byte count");
+        assert_eq!(m.entry, "decrypt");
+        // v3 records are counted by walking the framing, not by dividing by a size.
+        let stream = [9u8, 1, 0, 0, 0, 0, 0, 0, 0, 9, 2, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(m.count_records(&stream), 2);
+    }
+
+    /// Pre-v3 manifests (no `format`, or an older one) must still select the legacy
+    /// fixed-record ABI — jobs dispatched before v3 keep draining (CKF api.md §6).
+    #[test]
+    fn pre_v3_manifest_selects_the_legacy_abi() {
+        for src in [
+            r#"{"record_size":29,"out_cap":4096}"#,
+            r#"{"record_size":29,"out_cap":4096,"format":2}"#,
+        ] {
+            let m: Manifest = serde_json::from_str(src).expect("legacy manifest");
+            assert!(
+                matches!(m.abi(), cuda::Abi::Legacy { record_size: 29 }),
+                "{src}"
+            );
+            assert_eq!(m.entry, "decrypt", "entry still defaults");
+            assert_eq!(m.count_records(&[0u8; 29 * 3]), 3, "{src}");
+        }
+    }
 
     // The exact inline blob the platform handed back in the field, which rsurl
     // rejected as an "invalid URL": a gzip stream of a `PCB1`-tagged data blob.
