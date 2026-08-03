@@ -2,28 +2,38 @@
 //! nothing about the kernel's job — it uploads an opaque data blob, launches a
 //! kernel with the fixed ABI below over a range, and reads back the output records.
 //!
-//! Kernel ABI v4 (the contract every current decryptd cubin implements; the full
+//! Kernel ABI v5 (the contract every current decryptd cubin implements; the full
 //! spec is the publisher's `api.md`):
 //! ```c
 //! extern "C" __global__ void <entry>(
-//!     unsigned long long* start,   // in/out: the work cell, 2 + nlimbs x u64
-//!     unsigned long long count,    // items in this launch
-//!     const unsigned char* data,   // the opaque job data blob (device)
+//!     unsigned long long* start,   // in/out: the work cell, 2 + nthread x u64
+//!     unsigned long long count,    // thread-dimension steps in this launch
+//!     const unsigned char* data,   // the job data blob (device) — carries the box
 //!     unsigned long long data_len,
 //!     unsigned char* out,          // output byte-stream buffer (device)
 //!     unsigned int* out_count,     // atomic BYTE cursor
 //!     unsigned int out_cap);       // capacity in BYTES
 //! ```
-//! v4's only change from v3 is the work-item index: it is no longer fixed at 64
-//! bits but a little-endian sequence of `nlimbs` 64-bit limbs, and the `start` cell
-//! self-describes its width so a cubin built for a different one rejects the job
-//! instead of computing garbage. Some keyspaces need it — Coldcard Mk4 is 89 bits,
-//! and a 10-character brute over 95 glyphs is 3.2x `u64::MAX`.
+//! v5's change from v3 is the *shape* of the work space. v3 addressed work by one
+//! flat 64-bit index; v5 makes it a **box** of independent per-axis ranges, carried
+//! in the job blob, walked as a mixed-radix odometer. Real search spaces are boxes
+//! whose axes are not powers of two — flattening one wastes the padding (a Coldcard
+//! pad bound of 5e6 inside a 2^32 field leaves each slab 99.88% dead) and overflows
+//! 64 bits once axes stack. The cell carries a per-axis cursor instead of an index,
+//! and the resume watermark counts *steps of this launch* rather than naming an
+//! absolute position.
 //!
-//! Both older ABIs are still supported for jobs already dispatched against them
-//! (api.md §6): v3 (a 2-word cell, 64-bit index) and pre-v3 (`start` passed by
-//! value, `out_count`/`out_cap` counted in fixed-size records). The manifest's
-//! `format` field selects between them; see [`Abi`].
+//! `start[1]` declares how many leading axes this tiler enumerates, so a cubin built
+//! to walk a different split rejects the job instead of computing garbage. The axes
+//! behind that split are loop dimensions: a thread walks that whole sub-box itself,
+//! which is what keeps an expensive stage (a master PBKDF2) amortised across it.
+//!
+//! Two older ABIs are still supported for jobs already dispatched against them
+//! (api.md §6): v3 (a `[base, resume]` cell, 64-bit index) and pre-v3 (`start`
+//! passed by value, `out_count`/`out_cap` counted in fixed-size records). The
+//! manifest's `format` field selects between them; see [`Abi`]. v4 — a flat index of
+//! arbitrary limb width — is *not* among them: it was superseded before any job was
+//! dispatched, so nothing speaks it and decryptd refuses it outright.
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr;
@@ -162,109 +172,194 @@ pub enum Abi {
     /// `uleb128(len) ‖ payload` records. decryptd never parses a payload — it only
     /// walks the length prefixes to find where the stream ends.
     V3,
-    /// v4 (`format >= 4`): v3 with a self-describing work cell —
-    /// `[base_0, resume, nlimbs, base_1 … base_{nlimbs-1}]` — so the work-item index
-    /// can be wider than 64 bits. `index_words` is the manifest's `index_words`
-    /// (`nlimbs`), which must equal the width the cubin was built for or it rejects
-    /// the job outright.
-    V4 { index_words: u32 },
+    /// v5 (`format == 5`): the work space is a box of per-axis ranges carried in the
+    /// job blob, and `start` points at a `[resume, nthread, pos…]` cell. `thread_fields`
+    /// is the manifest's `thread_fields` — the leading axes this tiler enumerates, one
+    /// work item per cell — and must equal the count the cubin was built for or it
+    /// rejects the job outright.
+    V5 { thread_fields: u32 },
 }
 
-/// Upper bound on the manifest's `index_words`. Nothing needs more than two limbs
-/// today (the widest documented index is 89 bits); this only stops a malformed
-/// manifest from asking for an absurd work cell.
-const MAX_INDEX_WORDS: u32 = 16;
+/// Upper bound on a box's axis count. The deepest space in the spec is ten axes (an
+/// L10 brute, one per character); this only stops a malformed blob from making us
+/// allocate an absurd work cell.
+const MAX_BOX_FIELDS: usize = 64;
 
-/// Written to the resume slot by a cubin whose baked index width disagrees with the
-/// `nlimbs` we declared (the ABI-reject sentinel, api.md §1). It is outside the legal
-/// resume range `[base, base+count]`, so it can't be confused with a buffer-full
-/// watermark.
+/// Written to the resume slot by a cubin whose baked `nthread` disagrees with the one
+/// we declared (api.md §4.5). Unambiguous because a launch's `count` is always below
+/// it, so it can never be confused with a buffer-full watermark.
 const ABI_REJECT: u64 = u64::MAX;
 
-impl Abi {
-    /// Size of the `start` work cell in u64 words, or `None` for the legacy ABI that
-    /// passes the base index by value instead of through a cell.
-    fn cell_words(self) -> Option<usize> {
+/// The work space a v5 job searches: one inclusive `[start, end]` range per axis, read
+/// from the `CPB2` job blob (api.md §2). Axis order is least-significant-first, so
+/// axis 0 cycles fastest.
+///
+/// This is the one thing decryptd looks at inside the blob. It stays payload-agnostic
+/// otherwise — it needs the box only to walk the odometer, never to interpret a hit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkBox {
+    /// `(start, end)` inclusive per axis, all `nfields` of them.
+    axes: Vec<(u64, u64)>,
+    /// Leading axes the tiler enumerates (api.md §1.3). The rest are loop dimensions:
+    /// every thread walks that whole sub-box internally, so they never reach the cell.
+    nthread: usize,
+}
+
+const CPB2_MAGIC: u32 = 0x3242_5043; // "CPB2"
+
+impl WorkBox {
+    /// Parse the box out of a `CPB2` blob, taking `nthread` from the manifest.
+    fn parse(data: &[u8], thread_fields: u32) -> Result<WorkBox, String> {
+        let rd32 = |off: usize| -> Result<u32, String> {
+            data.get(off..off + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .ok_or_else(|| format!("job blob is {} bytes, too short for CPB2", data.len()))
+        };
+        let magic = rd32(0)?;
+        if magic != CPB2_MAGIC {
+            return Err(format!(
+                "job blob magic {magic:#010x} is not CPB2 ({CPB2_MAGIC:#010x}) — a v5 \
+                 manifest needs a v5 blob"
+            ));
+        }
+        let nfields = rd32(20)? as usize;
+        if nfields == 0 || nfields > MAX_BOX_FIELDS {
+            return Err(format!(
+                "job blob declares {nfields} box axes (expected 1..={MAX_BOX_FIELDS})"
+            ));
+        }
+        let need = 24 + 16 * nfields;
+        if data.len() < need {
+            return Err(format!(
+                "job blob is {} bytes, too short for {nfields} box axes ({need} needed)",
+                data.len()
+            ));
+        }
+        let at = |off: usize| u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+        let mut axes = Vec::with_capacity(nfields);
+        for i in 0..nfields {
+            let (lo, hi) = (at(24 + 8 * i), at(24 + 8 * (nfields + i)));
+            // api.md §1.5: `end < u64::MAX` keeps the radix from overflowing to 0, and
+            // `start <= end` keeps it non-empty. Both are the publisher's job; a blob
+            // that breaks either would make the odometer silently wrong.
+            if lo > hi {
+                return Err(format!("box axis {i} is empty: start {lo} > end {hi}"));
+            }
+            if hi == u64::MAX {
+                return Err(format!("box axis {i} ends at u64::MAX; it must be split"));
+            }
+            axes.push((lo, hi));
+        }
+        // An absent `thread_fields` means the whole box is thread dimensions — the
+        // shape a core with no amortising inner loop bakes.
+        let nthread = if thread_fields == 0 {
+            nfields
+        } else {
+            thread_fields as usize
+        };
+        if nthread > nfields {
+            return Err(format!(
+                "manifest thread_fields {nthread} exceeds the blob's {nfields} box axes"
+            ));
+        }
+        Ok(WorkBox { axes, nthread })
+    }
+
+    /// Span of axis `i` — its radix in the odometer.
+    fn radix(&self, i: usize) -> u128 {
+        let (lo, hi) = self.axes[i];
+        u128::from(hi - lo) + 1
+    }
+
+    /// Total thread-dimension cells in the box: the product of the thread axes' radices,
+    /// which is the unit the platform's fragment ranges and the manifest's `tile` count
+    /// in. Loop dimensions are not included — a thread walks those internally.
+    fn cells(&self) -> Result<u128, String> {
+        (0..self.nthread).try_fold(1u128, |acc, i| {
+            acc.checked_mul(self.radix(i))
+                .ok_or_else(|| "box has more than 2^128 thread-dimension cells".to_string())
+        })
+    }
+
+    /// Largest radix among the thread axes — the term api.md §1.5 bounds a launch's
+    /// `count` against, so the kernel's `(r_i - 1) + carry` cannot overflow.
+    fn max_radix(&self) -> u128 {
+        (0..self.nthread).map(|i| self.radix(i)).max().unwrap_or(1)
+    }
+
+    /// The odometer cursor `linear` steps into the box: one absolute axis value per
+    /// thread dimension, least-significant axis first (api.md §1.4 — the kernel then
+    /// advances this by `tid` the same digit-wise way).
+    fn cursor(&self, linear: u128) -> Vec<u64> {
+        let mut rest = linear;
+        (0..self.nthread)
+            .map(|i| {
+                let (lo, _) = self.axes[i];
+                let r = self.radix(i);
+                let digit = rest % r;
+                rest /= r;
+                lo + digit as u64
+            })
+            .collect()
+    }
+}
+
+/// Where a run currently sits, in whatever terms its ABI addresses work. This — not
+/// the [`Abi`] tag — is what shapes the work cell and the watermark read-back, so the
+/// two can never disagree.
+enum Cursor {
+    /// v3 / legacy: a flat 64-bit work-item index.
+    Index(u64),
+    /// v5: the odometer position over the box's thread dimensions.
+    Box(Vec<u64>),
+}
+
+impl Cursor {
+    /// Build the `start` work cell for a launch of `count` items (api.md §1.2/§6). v5
+    /// is `[resume=count, nthread, pos…]`; v3 is `[base, resume=base+count]`. (The
+    /// legacy ABI has no cell — it passes the base index by value and never calls this.)
+    ///
+    /// Under both cell ABIs the resume slot is *seeded* by the publisher and only ever
+    /// lowered by the kernel — v5 seeds it with the launch's step count, v3 with the
+    /// absolute end of the launch's range.
+    fn work_cell(&self, count: u64) -> Vec<u64> {
         match self {
-            Abi::Legacy { .. } => None,
-            Abi::V3 => Some(2),
-            Abi::V4 { index_words } => Some(2 + index_words as usize),
+            Cursor::Index(base) => vec![*base, base.saturating_add(count)],
+            Cursor::Box(pos) => {
+                let mut cell = Vec::with_capacity(2 + pos.len());
+                cell.push(count);
+                cell.push(pos.len() as u64);
+                cell.extend_from_slice(pos);
+                cell
+            }
         }
     }
 
-    /// Limbs in this job's work-item index. Only v4 can exceed one.
-    fn index_words(self) -> u32 {
+    /// Byte range of the resume slot within the cell: v5 puts it first, v3 second.
+    fn resume_slot(&self) -> std::ops::Range<usize> {
         match self {
-            Abi::V4 { index_words } => index_words,
-            Abi::Legacy { .. } | Abi::V3 => 1,
+            Cursor::Box(_) => 0..8,
+            Cursor::Index(_) => 8..16,
         }
     }
-}
 
-/// Build the `start` work cell for one launch of `[base, base+count)` (api.md §1):
-/// `[base_0, resume, nlimbs, base_1 …]` under v4, `[base_0, resume]` under v3. Empty
-/// under the legacy ABI, which has no cell.
-///
-/// `resume` is seeded to `base+count` ("ran to the end"); the kernel only ever lowers
-/// it. A launch that ends exactly on the limb-0 wrap has `base+count == 2^64`, which
-/// no u64 slot can hold, so the seed saturates — see [`read_resume`] for how that one
-/// launch is read back.
-///
-/// Base limbs above 1 are always zero: decryptd tiles a `u128` range, so a job that
-/// declares more than two limbs simply runs in the bottom two.
-fn work_cell(abi: Abi, base: u128, count: u64) -> Vec<u64> {
-    let Some(words) = abi.cell_words() else {
-        return Vec::new();
-    };
-    let mut cell = vec![0u64; words];
-    let limb0 = base as u64;
-    cell[0] = limb0;
-    cell[1] = u64::try_from(u128::from(limb0) + u128::from(count)).unwrap_or(u64::MAX);
-    if let Abi::V4 { index_words } = abi {
-        cell[2] = u64::from(index_words);
-        if index_words >= 2 {
-            cell[3] = (base >> 64) as u64;
+    /// How many steps of a launch of `count` items completed, read back from the resume
+    /// slot (api.md §4). `Err` means the cubin refused the job — its baked shape
+    /// disagrees with what the manifest declared, so every launch would fail the same.
+    ///
+    /// v5's watermark is *launch-relative* ("steps done"), which is what removed v4's
+    /// one unresolvable corner: there is no absolute end value that might not fit the
+    /// slot, and "ran to the end" is just `count`, not a distinguished sentinel.
+    fn steps_done(&self, count: u64, resume: u64) -> Result<u64, ()> {
+        match self {
+            Cursor::Box(_) if resume == ABI_REJECT => Err(()),
+            Cursor::Box(_) => Ok(resume.min(count)),
+            // v3's watermark is the absolute index it stopped at. Clamp: a kernel that
+            // leaves the cell untouched (or writes nonsense) must not rewind the range
+            // or carry it past the end.
+            Cursor::Index(base) => Ok(resume.clamp(*base, base.saturating_add(count)) - base),
         }
     }
-    cell
-}
-
-/// What a finished launch's resume watermark says about how far it got (api.md §4).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Resume {
-    /// Every work-item in `[base, base+count)` was processed and recorded.
-    Complete,
-    /// The output buffer filled. Everything below this work index is fully recorded;
-    /// the rest of the launch's range must be re-run.
-    Filled(u128),
-    /// The cubin refused the job: it was built for a different index width than the
-    /// `nlimbs` we declared. Retrying is pointless.
-    Rejected,
-}
-
-/// Interpret the watermark a launch left in `start[1]`, given the launch's own
-/// `[base, base+count)`.
-///
-/// The one wrinkle is the launch that ends exactly on the limb-0 wrap: its seed
-/// saturated to `u64::MAX`, which is also the rejection sentinel, so that one launch
-/// reads back as `Complete` either way. That is the safe reading — a cubin rejects
-/// every launch of a job or none, so a rejection has already surfaced on an earlier
-/// launch — and the caller re-checks the byte cursor there to catch the overflow the
-/// saturated watermark cannot express.
-fn read_resume(base: u128, count: u64, resume: u64) -> Resume {
-    let limb0 = base as u64;
-    let seed = u64::try_from(u128::from(limb0) + u128::from(count)).unwrap_or(u64::MAX);
-    if resume == ABI_REJECT && seed != ABI_REJECT {
-        return Resume::Rejected;
-    }
-    if resume >= seed {
-        // At or above the seed: untouched (or garbage past the legal range, which
-        // clamps the same way) — the launch ran to the end.
-        return Resume::Complete;
-    }
-    // Below `base` can't happen from a legal `atomicMin`; saturating there reports no
-    // progress, which the caller handles as "retry this position with fewer items".
-    Resume::Filled(base + u128::from(resume.saturating_sub(limb0)))
 }
 
 /// Length of the valid prefix of a framed stream (api.md §3 — the record framing is
@@ -497,12 +592,12 @@ impl Drop for Gpu {
 ///
 /// `out_cap` bounds only the *on-device* output buffer (one launch's matches), not
 /// the job's total result count: the buffer is drained after every launch. It counts
-/// records under [`Abi::Legacy`] and bytes under v3/v4. Either way, under-sizing it is
+/// records under [`Abi::Legacy`] and bytes under v3/v5. Either way, under-sizing it is
 /// safe — no result is ever dropped — but the ABIs recover differently:
 ///
-/// * **v3/v4** use the kernel's resume watermark (api.md §4). A launch whose buffer
-///   fills reports the lowest work-index it could not record; everything below that
-///   is complete, so the next launch simply restarts there. No work is redone.
+/// * **v3/v5** use the kernel's resume watermark (api.md §4). A launch whose buffer
+///   fills reports how far it got; everything before that is complete, so the next
+///   launch simply restarts there. No work is redone.
 /// * **legacy** has no watermark, so an overflowing launch's buffer holds an arbitrary
 ///   subset (whichever threads won the atomic race) and is unusable. The per-launch
 ///   item count adapts to the observed match density, targeting ~7/8 fill, and an
@@ -512,9 +607,12 @@ impl Drop for Gpu {
 /// Under either ABI, a single item that alone overflows `out_cap` is a hard error
 /// (the cap is too small for the job).
 ///
-/// The range is a `u128` because a v4 work index can exceed 64 bits. Under v3 and
-/// legacy — and under a v4 job that declares a single limb — a range reaching past
-/// `u64::MAX` is rejected up front rather than silently truncated.
+/// `start`/`end_incl` are the platform's fragment range. Under v5 they are a linear
+/// offset into the box's thread-dimension cells — the same unit `tile` counts in — and
+/// decryptd converts each position to an odometer cursor via the box in `data`. Under
+/// v3 and legacy they are the flat work-item index directly, and a range past
+/// `u64::MAX` is rejected up front rather than silently truncated. They are `u128`
+/// either way because a box's cell count routinely exceeds 64 bits (api.md §1.1).
 #[allow(clippy::too_many_arguments)]
 pub fn run_job(
     gpu: &Gpu,
@@ -540,7 +638,7 @@ pub fn run_job(
     if out_cap == 0 {
         return Err("manifest out_cap is 0".into());
     }
-    // Bytes of output buffer per unit of `out_cap`: v3/v4 count bytes directly, legacy
+    // Bytes of output buffer per unit of `out_cap`: v3/v5 count bytes directly, legacy
     // counts fixed-size records.
     let cap_unit = match abi {
         Abi::Legacy { record_size } => {
@@ -549,35 +647,54 @@ pub fn run_job(
             }
             record_size as usize
         }
-        Abi::V3 | Abi::V4 { .. } => 1,
+        Abi::V3 | Abi::V5 { .. } => 1,
     };
-    // A v4 job declares its index width; every other ABI is 64-bit by construction.
-    let index_words = abi.index_words();
-    if index_words == 0 || index_words > MAX_INDEX_WORDS {
-        return Err(format!(
-            "manifest index_words {index_words} out of range (1..={MAX_INDEX_WORDS})"
-        ));
-    }
-    if index_words < 2 && end_incl > u128::from(u64::MAX) {
-        return Err(format!(
-            "fragment reaches work index {end_incl}, past the 64-bit index this job \
-             declares (format/index_words)"
-        ));
-    }
+    // v5 reads the work space out of the job blob; every other ABI addresses work by a
+    // flat 64-bit index, so its range must fit one.
+    let work_box = match abi {
+        Abi::V5 { thread_fields } => Some(WorkBox::parse(data, thread_fields)?),
+        Abi::Legacy { .. } | Abi::V3 => {
+            if end_incl > u128::from(u64::MAX) {
+                return Err(format!(
+                    "fragment reaches work index {end_incl}, past the 64-bit index this \
+                     job's ABI addresses"
+                ));
+            }
+            None
+        }
+    };
+    // The box bounds the run: the publisher may hand out a fragment that overshoots it
+    // (api.md §1.4 lets the odometer's carry stop over-sized launches), but there is no
+    // point launching for cells that don't exist.
+    let end_incl = match &work_box {
+        Some(b) => end_incl.min(b.cells()?.saturating_sub(1)),
+        None => end_incl,
+    };
 
     let func = gpu.function(entry)?;
     let d_data = DeviceBuf::from_slice(data)?;
     let d_out = DeviceBuf::alloc(cap_unit * out_cap as usize)?;
     let d_count = DeviceBuf::alloc(4)?;
-    // v3/v4 only: the work cell that `start` points at. Its presence is also what
+    // v3/v5 only: the work cell that `start` points at. Its presence is also what
     // marks this run as framed below.
-    let d_start = match abi.cell_words() {
-        Some(words) => Some(DeviceBuf::alloc(8 * words)?),
-        None => None,
+    let d_start = match (abi, &work_box) {
+        (Abi::Legacy { .. }, _) => None,
+        // `[resume, nthread, pos…]`, one cursor word per thread dimension. Sized from
+        // the parsed box, not the manifest field, which may have left `nthread` implied.
+        (Abi::V5 { .. }, Some(b)) => Some(DeviceBuf::alloc(8 * (2 + b.nthread))?),
+        _ => Some(DeviceBuf::alloc(16)?), // v3: `[base, resume]`
     };
 
     let total = end_incl.saturating_sub(start).saturating_add(1);
-    let tile = tile.max(1);
+    // api.md §1.5 bounds a launch: `count < u64::MAX` keeps the rejection sentinel
+    // unambiguous, and `count <= u64::MAX - max(r_i)` keeps the kernel's per-thread
+    // `(r_i - 1) + carry` from overflowing. No real tile comes near either, but a
+    // manifest is publisher input — clamp it rather than trust it.
+    let tile_cap = match &work_box {
+        Some(b) => u64::try_from(u128::from(u64::MAX) - b.max_radix()).unwrap_or(u64::MAX - 1),
+        None => u64::MAX - 1,
+    };
+    let tile = tile.clamp(1, tile_cap.max(1));
     let mut results = Vec::new();
     let mut done = 0u128;
     let mut cur = start;
@@ -585,7 +702,7 @@ pub fn run_job(
     // (a paused worker must not time out). Checked once per tile below.
     let started = Instant::now();
     let mut paused = Duration::ZERO;
-    // Items per launch. Under v3/v4 this stays a full tile: a launch that fills the
+    // Items per launch. Under v3/v5 this stays a full tile: a launch that fills the
     // buffer still counts, because the resume watermark says where to pick up, so
     // there is nothing to calibrate. Under legacy it adapts to the observed match
     // density so each launch fills — but does not overflow — the `out_cap` buffer,
@@ -606,34 +723,35 @@ pub fn run_job(
             ));
         }
 
-        // A launch must never cross a limb-0 wrap (api.md §1): that is what keeps every
-        // limb above 0 constant across it, so a thread's index is `base + tid` in limb
-        // 0 with the high limbs copied, and the watermark stays a plain 64-bit atomic.
-        // Splitting there costs nothing — it happens once per 2^64 items.
-        let limb0 = cur as u64;
-        let to_wrap = (1u128 << 64) - u128::from(limb0);
+        // Where this launch starts, in the terms its ABI addresses work: an odometer
+        // cursor over the box's thread dimensions under v5, a flat index otherwise.
+        let cursor = match &work_box {
+            Some(b) => Cursor::Box(b.cursor(cur)),
+            None => Cursor::Index(cur as u64), // range checked to fit a u64 above
+        };
         let count = ((end_incl - cur).saturating_add(1))
             .min(u128::from(launch))
-            .min(to_wrap)
             .max(1) as u64;
         let end_x = cur + u128::from(count);
         d_count.memset0()?;
         if let Some(ds) = &d_start {
-            // v3/v4: zero the output buffer — the zero tail *is* the stream terminator,
+            // v3/v5: zero the output buffer — the zero tail *is* the stream terminator,
             // and it also masks the previous launch's bytes past an overflow point —
-            // and seed the work cell (resume = "ran to the end").
+            // and seed the work cell (the kernel only ever lowers the resume slot).
             d_out.memset0()?;
-            let cell: Vec<u8> = work_cell(abi, cur, count)
+            let cell: Vec<u8> = cursor
+                .work_cell(count)
                 .iter()
                 .flat_map(|w| w.to_le_bytes())
                 .collect();
             ds.htod(&cell)?;
         }
-        // v3/v4 pass a device pointer to the work cell; legacy passes the base index by
-        // value. Both are one u64-sized argument slot.
-        let mut a_start = match &d_start {
-            Some(ds) => ds.ptr,
-            None => limb0, // the range was checked to fit a u64 above
+        // v3/v5 pass a device pointer to the work cell; legacy passes the base index by
+        // value (its cursor is always an `Index`). Both are one u64-sized slot.
+        let mut a_start = match (&d_start, &cursor) {
+            (Some(ds), _) => ds.ptr,
+            (None, Cursor::Index(base)) => *base,
+            (None, Cursor::Box(_)) => 0,
         };
         let mut a_count = count;
         let (mut a_data, mut a_dlen) = (d_data.ptr, data.len() as u64);
@@ -678,36 +796,22 @@ pub fn run_job(
         let raw = u32::from_le_bytes(cb);
 
         if let Some(ds) = &d_start {
-            // ---- v3/v4: the resume watermark says exactly how far this launch got.
+            // ---- v3/v5: the resume watermark says exactly how far this launch got.
+            // v5 puts it in `start[0]`, v3 in `start[1]`.
             let mut cell = vec![0u8; ds.len];
             ds.dtoh(&mut cell)?;
-            let resume = u64::from_le_bytes(cell[8..16].try_into().unwrap());
-            let mut next = match read_resume(cur, count, resume) {
-                Resume::Complete => end_x,
-                Resume::Filled(n) => n,
-                // The cubin was built for a different index width than the manifest
-                // declares. Every launch of this job would fail the same way, so stop
-                // here rather than burn the whole fragment discovering it repeatedly.
-                Resume::Rejected => {
-                    return Err(format!(
-                        "cubin refused the job (ABI-reject sentinel): it was not built \
-                         for the manifest's index_words={index_words}"
-                    ));
-                }
-            };
-            // The one launch that ends exactly on the limb-0 wrap could not be seeded
-            // with a distinguishable watermark (`limb0+count` is 2^64, which the u64
-            // slot can't hold), so an overflow on its very last work-item leaves
-            // `resume` looking complete. The byte cursor still shows the buffer filled,
-            // and that combination is otherwise impossible — re-run that one item
-            // against a fresh buffer rather than risk dropping its records.
-            let seed_saturated = u128::from(limb0) + u128::from(count) > u128::from(u64::MAX);
-            if next == end_x && raw > out_cap && seed_saturated {
-                next = end_x - 1;
-            }
-            if next == cur {
-                // The buffer filled before item `cur` itself could be recorded, so
-                // this launch made no progress. Retry the same position with fewer
+            let resume = u64::from_le_bytes(cell[cursor.resume_slot()].try_into().unwrap());
+            // A rejection means the cubin was built for a different `nthread` than the
+            // manifest declares. Every launch of this job would fail the same way, so
+            // stop rather than burn the whole fragment discovering it repeatedly.
+            let steps = cursor.steps_done(count, resume).map_err(|()| {
+                "cubin refused the job (ABI-reject sentinel): it was not built for the \
+                 manifest's thread_fields"
+                    .to_string()
+            })?;
+            if steps == 0 {
+                // The buffer filled before the launch's very first item could be
+                // recorded, so it made no progress. Retry the same position with fewer
                 // items — a fresh, empty buffer usually clears it. If a single item
                 // still can't fit, `out_cap` is genuinely too small for this job.
                 if count <= 1 {
@@ -719,16 +823,17 @@ pub fn run_job(
                 launch = count / 2;
                 continue; // do not advance `cur`/`done`
             }
+            let next = cur + u128::from(steps);
             // `raw` is the byte cursor, which overshoots `out_cap` when the buffer
             // filled; the framing walk finds the true end of the written prefix.
             //
-            // Everything below the watermark is complete, so we keep the whole prefix
+            // Everything before the watermark is complete, so we keep the whole prefix
             // and restart at `next`. Threads race, so a filled buffer can also hold
-            // records for work-indices at or above the watermark, and re-running from
-            // it emits those a second time. That's inherent to the ABI (api.md §4
-            // prescribes exactly this loop) and decryptd can't dedup — it doesn't know
-            // the payload layout, so it can't tell which index a record belongs to.
-            // The consumer tolerates a repeated record; a dropped one it could not.
+            // records for steps at or past the watermark, and re-running from it emits
+            // those a second time. That's inherent to the ABI (api.md §4 prescribes
+            // exactly this loop) and decryptd can't dedup — it doesn't know the payload
+            // layout, so it can't tell which cell a record belongs to. The consumer
+            // tolerates a repeated record; a dropped one it could not.
             let written = (raw as usize).min(out_cap as usize);
             if written > 0 {
                 let mut buf = vec![0u8; written];
@@ -908,72 +1013,134 @@ mod tests {
         assert_eq!(count_framed_records(&buf), 0);
     }
 
-    /// The v4 work cell (api.md §1): `[base_0, resume, nlimbs, base_1 …]`, with the
-    /// base index split into little-endian 64-bit limbs and `resume` seeded to
-    /// `base+count`. v3's cell is the same minus the self-describing tail.
+    /// Build a `CPB2` blob header carrying `axes` (api.md §2). The param and charset
+    /// regions that follow it are what decryptd never looks at.
+    fn cpb2(axes: &[(u64, u64)]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&CPB2_MAGIC.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes()); // algo
+        b.extend_from_slice(&0u32.to_le_bytes()); // pwlen
+        b.extend_from_slice(&0u32.to_le_bytes()); // clen
+        b.extend_from_slice(&0u32.to_le_bytes()); // nparam
+        b.extend_from_slice(&(axes.len() as u32).to_le_bytes()); // nfields
+        for (lo, _) in axes {
+            b.extend_from_slice(&lo.to_le_bytes());
+        }
+        for (_, hi) in axes {
+            b.extend_from_slice(&hi.to_le_bytes());
+        }
+        b
+    }
+
+    /// The box comes out of the blob, and its thread axes are what the fragment range
+    /// and `tile` count in — loop dimensions are walked inside a thread and must not
+    /// inflate the cell count (api.md §1.3).
+    #[test]
+    fn work_box_parses_and_counts_thread_cells() {
+        // A `[pad, ssr, tod]` box with a `warm` loop dimension behind it.
+        let axes = [(0, 4_999_999), (0, 254), (0, 86_399), (0, 224)];
+        let blob = cpb2(&axes);
+
+        let b = WorkBox::parse(&blob, 3).expect("three thread dimensions");
+        assert_eq!(b.cells().unwrap(), 5_000_000 * 255 * 86_400);
+        // The loop axis is parsed but excluded from the tiled space.
+        assert_eq!(b.axes.len(), 4);
+
+        // Every axis a thread dimension: the loop axis now multiplies in.
+        let b = WorkBox::parse(&blob, 4).expect("four thread dimensions");
+        assert_eq!(b.cells().unwrap(), 5_000_000 * 255 * 86_400 * 225);
+
+        // An absent `thread_fields` (0) means exactly that — the whole box.
+        assert_eq!(WorkBox::parse(&blob, 0).unwrap(), b);
+
+        // `thread_fields` past the blob's axis count is a mismatch, not a clamp.
+        assert!(WorkBox::parse(&blob, 5).is_err());
+    }
+
+    /// The odometer: axis 0 cycles fastest, and each digit is an absolute axis value
+    /// (`start_i` + digit), not an offset (api.md §1.4/§2).
+    #[test]
+    fn work_box_cursor_walks_least_significant_first() {
+        // Radices 10 and 7, both offset off zero so absolute values are visible.
+        let b = WorkBox::parse(&cpb2(&[(100, 109), (5, 11)]), 2).unwrap();
+        assert_eq!(b.cells().unwrap(), 70);
+        assert_eq!(b.cursor(0), vec![100, 5]);
+        assert_eq!(b.cursor(1), vec![101, 5]); // axis 0 cycles fastest
+        assert_eq!(b.cursor(9), vec![109, 5]);
+        assert_eq!(b.cursor(10), vec![100, 6]); // carry into axis 1
+        assert_eq!(b.cursor(69), vec![109, 11]); // last cell in the box
+
+        // A box far past 2^64 is addressed digit-wise with no flat index formed —
+        // an L10 brute over 95 glyphs is 95^10 = 2^66.4 cells.
+        let l10 = WorkBox::parse(&cpb2(&[(0, 94); 10]), 10).unwrap();
+        assert_eq!(l10.cells().unwrap(), 95u128.pow(10));
+        assert!(l10.cells().unwrap() > u128::from(u64::MAX));
+        assert_eq!(l10.cursor(95 * 95), vec![0, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    /// A blob that isn't CPB2, or whose axes break api.md §1.5, must be a handled error
+    /// — the odometer would be silently wrong rather than loudly broken.
+    #[test]
+    fn work_box_rejects_malformed_blobs() {
+        assert!(WorkBox::parse(&[], 1).is_err(), "empty blob");
+        let mut wrong_magic = cpb2(&[(0, 9)]);
+        wrong_magic[0] ^= 0xff;
+        assert!(WorkBox::parse(&wrong_magic, 1).is_err(), "not CPB2");
+        // Truncated before the end[] array.
+        let full = cpb2(&[(0, 9), (0, 9)]);
+        assert!(WorkBox::parse(&full[..full.len() - 8], 2).is_err(), "short");
+        // start > end is an empty axis; end == u64::MAX overflows the radix to 0.
+        assert!(WorkBox::parse(&cpb2(&[(9, 0)]), 1).is_err(), "empty axis");
+        assert!(
+            WorkBox::parse(&cpb2(&[(0, u64::MAX)]), 1).is_err(),
+            "full u64"
+        );
+    }
+
+    /// The v5 work cell (api.md §1.2) is `[resume, nthread, pos…]` with `resume` seeded
+    /// to the launch's step count — v3's is `[base, base+count]`, and the legacy ABI has
+    /// no cell at all.
     #[test]
     fn work_cell_layout() {
-        assert_eq!(work_cell(Abi::V3, 100, 8), vec![100, 108]);
+        let b = WorkBox::parse(&cpb2(&[(100, 109), (5, 11)]), 2).unwrap();
+        let cur = Cursor::Box(b.cursor(12));
+        assert_eq!(cur.work_cell(8), vec![8, 2, 102, 6]);
+        assert_eq!(cur.resume_slot(), 0..8, "v5 puts resume first");
+
+        let idx = Cursor::Index(100);
         assert_eq!(
-            work_cell(Abi::V4 { index_words: 1 }, 100, 8),
-            vec![100, 108, 1]
+            idx.work_cell(8),
+            vec![100, 108],
+            "v3 seeds the absolute end of its range",
         );
-        // A Coldcard Mk4-style 89-bit index: limb 1 carries the RTC state.
-        let base = (7u128 << 64) | 100;
-        assert_eq!(
-            work_cell(Abi::V4 { index_words: 2 }, base, 8),
-            vec![100, 108, 2, 7],
-        );
-        // More limbs than a u128 range can fill: the rest are zero, not garbage.
-        assert_eq!(
-            work_cell(Abi::V4 { index_words: 4 }, base, 8),
-            vec![100, 108, 4, 7, 0, 0],
-        );
-        // The legacy ABI has no cell at all — `start` is passed by value.
-        assert!(work_cell(Abi::Legacy { record_size: 8 }, 100, 8).is_empty());
+        assert_eq!(idx.resume_slot(), 8..16, "v3 puts resume second");
     }
 
-    /// The watermark a launch leaves behind decodes to one of three outcomes, and the
-    /// "filled" one must translate back into a full-width `u128` work index.
+    /// The watermark says how many steps of the launch completed. v5's is
+    /// launch-relative, v3's is the absolute index it stopped at; both reduce to the
+    /// same "steps done" the caller advances its cursor by.
     #[test]
-    fn resume_watermark_outcomes() {
+    fn resume_watermark_reports_steps_done() {
+        let cur = Cursor::Box(vec![100]);
         // Untouched seed: the launch ran to the end.
-        assert_eq!(read_resume(100, 8, 108), Resume::Complete);
-        // Buffer filled at 104: everything below it is recorded.
-        assert_eq!(read_resume(100, 8, 104), Resume::Filled(104));
-        // Filled at the very first item — no progress; the caller retries smaller.
-        assert_eq!(read_resume(100, 8, 100), Resume::Filled(100));
-        // The watermark is in limb-0 units, so the high limbs come back from `base`.
-        let base = (7u128 << 64) | 100;
-        assert_eq!(
-            read_resume(base, 8, 104),
-            Resume::Filled((7u128 << 64) | 104)
-        );
-        // Width mismatch: the cubin refused the job outright.
-        assert_eq!(read_resume(100, 8, u64::MAX), Resume::Rejected);
-        // Garbage below the base can't come from a legal atomicMin; report no progress
-        // rather than rewinding the range.
-        assert_eq!(read_resume(100, 8, 3), Resume::Filled(100));
-    }
+        assert_eq!(cur.steps_done(8, 8), Ok(8));
+        // Buffer filled after 5 steps; everything before that is recorded.
+        assert_eq!(cur.steps_done(8, 5), Ok(5));
+        // Filled before the first step — no progress; the caller retries smaller.
+        assert_eq!(cur.steps_done(8, 0), Ok(0));
+        // Garbage above the seed can't come from a legal atomicMin; clamp to the count
+        // rather than carrying the cursor past the launch.
+        assert_eq!(cur.steps_done(8, 99), Ok(8));
+        // `nthread` mismatch: the cubin refused the job outright.
+        assert_eq!(cur.steps_done(8, u64::MAX), Err(()));
 
-    /// A launch ending exactly on the limb-0 wrap can't hold `base+count == 2^64` in
-    /// the u64 resume slot, so the seed saturates. It must still read back as complete
-    /// — and must not be mistaken for a rejection, since `u64::MAX` is the seed here.
-    #[test]
-    fn resume_watermark_at_the_limb_wrap() {
-        let base = u128::from(u64::MAX) - 9; // [2^64-10, 2^64)
-        assert_eq!(work_cell(Abi::V4 { index_words: 2 }, base, 10)[1], u64::MAX);
-        assert_eq!(read_resume(base, 10, u64::MAX), Resume::Complete);
-        assert_eq!(
-            read_resume(base, 10, u64::MAX - 5),
-            Resume::Filled(base + 4)
-        );
-        // Only the watermark wraps, not the index: a launch sitting above 2^64 but
-        // inside its limb seeds an ordinary in-range value and reads back normally.
-        let high = (1u128 << 64) + 100;
-        assert_eq!(work_cell(Abi::V4 { index_words: 2 }, high, 10)[1], 110);
-        assert_eq!(read_resume(high, 10, 110), Resume::Complete);
-        assert_eq!(read_resume(high, 10, u64::MAX), Resume::Rejected);
+        // v3's slot holds an absolute index, so the same outcomes come out shifted.
+        let idx = Cursor::Index(100);
+        assert_eq!(idx.steps_done(8, 108), Ok(8));
+        assert_eq!(idx.steps_done(8, 105), Ok(5));
+        assert_eq!(idx.steps_done(8, 100), Ok(0));
+        assert_eq!(idx.steps_done(8, 3), Ok(0), "below base: clamped");
+        assert_eq!(idx.steps_done(8, u64::MAX), Ok(8));
     }
 
     /// Verifies the density-adaptive overflow path: with an `out_cap` far smaller

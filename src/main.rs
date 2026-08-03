@@ -162,10 +162,10 @@ struct DataRef {
     hash: String,
 }
 
-/// Fragment ranges are arbitrary-precision decimal strings on the platform (a job's
-/// keyspace can exceed 64 bits — ABI v4 exists for exactly that), so parse them as
-/// `u128`; accept a JSON number too, just in case. `u128` covers a two-limb work
-/// index, which is the widest any current core declares.
+/// Fragment ranges are arbitrary-precision decimal strings on the platform, so parse
+/// them as `u128`; accept a JSON number too, just in case. A v5 job's keyspace routinely
+/// exceeds 64 bits once its box's axes stack (api.md §1.1), and the range indexes that
+/// box's thread-dimension cells — `u128` covers every box a core declares today.
 fn de_u128<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u128, D::Error> {
     use serde::de::Error;
     match Value::deserialize(d)? {
@@ -193,21 +193,23 @@ struct Manifest {
     /// **Pre-v3 only** — a v3+ stream is self-delimiting, so those manifests omit it.
     #[serde(default)]
     record_size: u32,
-    /// Output buffer capacity — in *bytes* under v3/v4, in *records* pre-v3.
+    /// Output buffer capacity — in *bytes* under v3/v5, in *records* pre-v3.
     #[serde(default = "d_out_cap")]
     out_cap: u32,
     /// CUDA block size.
     #[serde(default = "d_block")]
     block: u32,
-    /// Work-items per kernel launch (tiles a large range).
+    /// Work-items per kernel launch. Under v5 these are thread-dimension cells of the
+    /// box (api.md §1.3), the same unit the fragment range counts in.
     #[serde(default = "d_tile")]
     tile: u64,
-    /// 64-bit limbs in the work-item index (`nlimbs`, api.md §1) — **v4 only**, and a
-    /// property of the cubin: declare the wrong width and it refuses the job. Absent
-    /// means one limb, the plain 64-bit index every pre-v4 core uses.
-    #[serde(default = "d_index_words")]
-    index_words: u32,
-    /// Output format version: `4` selects the v4 kernel ABI, `3` the v3 one; absent or
+    /// Leading box axes the tiler enumerates (`nthread`, api.md §1.3) — **v5 only**,
+    /// and a property of the cubin, not of the job: declare the wrong count and it
+    /// refuses the job. `0` (absent) means every axis in the blob is a thread
+    /// dimension, which is the shape a core with no amortising inner loop bakes.
+    #[serde(default)]
+    thread_fields: u32,
+    /// Output format version: `5` selects the v5 kernel ABI, `3` the v3 one; absent or
     /// `< 3` selects the legacy fixed-record ABI (api.md §5/§6).
     #[serde(default)]
     format: u32,
@@ -215,25 +217,28 @@ struct Manifest {
 
 impl Manifest {
     /// Which kernel ABI this job's cubins implement.
-    fn abi(&self) -> cuda::Abi {
+    fn abi(&self) -> Result<cuda::Abi> {
         match self.format {
-            0..=2 => cuda::Abi::Legacy {
+            0..=2 => Ok(cuda::Abi::Legacy {
                 record_size: self.record_size,
-            },
-            3 => cuda::Abi::V3,
-            // Newer formats are read as v4: its work cell is self-describing, so a
-            // cubin that needs something else rejects the job rather than mis-running.
-            _ => cuda::Abi::V4 {
-                index_words: self.index_words,
-            },
+            }),
+            3 => Ok(cuda::Abi::V3),
+            // v4 was specified and then superseded before a single job was dispatched
+            // (api.md §6), so there is nothing to stay compatible with — and its work
+            // cell would be misread as v5's. Refuse it rather than guess.
+            4 => bail!("manifest format 4 was never dispatched and is not supported"),
+            5 => Ok(cuda::Abi::V5 {
+                thread_fields: self.thread_fields,
+            }),
+            other => bail!("manifest format {other} is newer than this worker supports"),
         }
     }
 
     /// Number of output records in a finished fragment's buffer — for logs and submit
     /// telemetry only; decryptd never interprets a record's contents.
-    fn count_records(&self, output: &[u8]) -> usize {
-        match self.abi() {
-            cuda::Abi::V3 | cuda::Abi::V4 { .. } => cuda::count_framed_records(output),
+    fn count_records(&self, abi: cuda::Abi, output: &[u8]) -> usize {
+        match abi {
+            cuda::Abi::V3 | cuda::Abi::V5 { .. } => cuda::count_framed_records(output),
             cuda::Abi::Legacy { record_size } => output.len() / record_size.max(1) as usize,
         }
     }
@@ -249,9 +254,6 @@ fn d_block() -> u32 {
 }
 fn d_tile() -> u64 {
     1 << 24
-}
-fn d_index_words() -> u32 {
-    1
 }
 
 // --------------------------------------------------------------------- helpers
@@ -953,16 +955,14 @@ fn decode_stream(dec: &mut dyn compcol::Decoder, input: &[u8]) -> Result<Vec<u8>
 const JOB_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJob> {
+    let abi = job.manifest.abi()?;
     let gpu = cuda::Gpu::load_first(ordinal, &job.cubins).map_err(|e| anyhow!(e))?;
     let (maj, min) = gpu.compute_capability();
     let cubin_arch = gpu.cubin_arch();
     let gpu_name = gpu.device_name();
     eprintln!(
-        "[decryptd] running [{}, {}) on GPU#{ordinal} {gpu_name} (sm_{maj}{min}, cubin sm{cubin_arch}): entry={} abi={:?}",
-        job.start,
-        job.end,
-        job.manifest.entry,
-        job.manifest.abi(),
+        "[decryptd] running [{}, {}) on GPU#{ordinal} {gpu_name} (sm_{maj}{min}, cubin sm{cubin_arch}): entry={} abi={abi:?}",
+        job.start, job.end, job.manifest.entry,
     );
     let t0 = Instant::now();
     let output = cuda::run_job(
@@ -971,7 +971,7 @@ fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJo
         &job.data,
         job.start,
         job.end - 1, // run_job's range is inclusive
-        job.manifest.abi(),
+        abi,
         job.manifest.out_cap,
         job.manifest.block,
         job.manifest.tile,
@@ -993,7 +993,7 @@ fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJo
     )
     .map_err(|e| anyhow!("run_job: {e}"))?;
     let run_secs = t0.elapsed().as_secs_f64();
-    let records = job.manifest.count_records(&output);
+    let records = job.manifest.count_records(abi, &output);
     eprintln!(
         "[decryptd] GPU#{ordinal} ran [{}, {}): {records} record(s) in {run_secs:.1}s",
         job.start, job.end
@@ -1469,12 +1469,13 @@ mod tests {
         let m: Manifest =
             serde_json::from_str(r#"{"entry":"decrypt","out_cap":1048576,"format":3}"#)
                 .expect("v3 manifest must parse without record_size");
-        assert!(matches!(m.abi(), cuda::Abi::V3));
+        let abi = m.abi().expect("v3 is a supported format");
+        assert!(matches!(abi, cuda::Abi::V3));
         assert_eq!(m.out_cap, 1048576, "v3 out_cap is a byte count");
         assert_eq!(m.entry, "decrypt");
         // v3 records are counted by walking the framing, not by dividing by a size.
         let stream = [9u8, 1, 0, 0, 0, 0, 0, 0, 0, 9, 2, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(m.count_records(&stream), 2);
+        assert_eq!(m.count_records(abi, &stream), 2);
     }
 
     /// Pre-v3 manifests (no `format`, or an older one) must still select the legacy
@@ -1486,37 +1487,57 @@ mod tests {
             r#"{"record_size":29,"out_cap":4096,"format":2}"#,
         ] {
             let m: Manifest = serde_json::from_str(src).expect("legacy manifest");
+            let abi = m.abi().expect("legacy is a supported format");
             assert!(
-                matches!(m.abi(), cuda::Abi::Legacy { record_size: 29 }),
+                matches!(abi, cuda::Abi::Legacy { record_size: 29 }),
                 "{src}"
             );
             assert_eq!(m.entry, "decrypt", "entry still defaults");
-            assert_eq!(m.count_records(&[0u8; 29 * 3]), 3, "{src}");
+            assert_eq!(m.count_records(abi, &[0u8; 29 * 3]), 3, "{src}");
         }
     }
 
-    /// A v4 manifest adds `index_words` — the width of the work-item index its cubins
-    /// were built for. It defaults to one limb (the plain 64-bit index), so a v4
-    /// manifest that omits it behaves exactly like v3 apart from the cell layout.
+    /// A v5 manifest adds `thread_fields` — how many leading box axes the tiler
+    /// enumerates. Absent means every axis in the blob is a thread dimension, which is
+    /// what a core with no amortising inner loop bakes.
     #[test]
-    fn v4_manifest_selects_the_index_width() {
-        let m: Manifest = serde_json::from_str(r#"{"out_cap":1048576,"format":4}"#)
-            .expect("v4 manifest must parse without index_words");
-        assert!(matches!(m.abi(), cuda::Abi::V4 { index_words: 1 }));
-
-        let m: Manifest = serde_json::from_str(r#"{"out_cap":1048576,"format":4,"index_words":2}"#)
-            .expect("v4 manifest with a wide index");
-        assert!(matches!(m.abi(), cuda::Abi::V4 { index_words: 2 }));
+    fn v5_manifest_selects_the_thread_dimensions() {
+        let m: Manifest = serde_json::from_str(r#"{"out_cap":1048576,"format":5}"#)
+            .expect("v5 manifest must parse without thread_fields");
+        let abi = m.abi().expect("v5 is supported");
+        assert!(matches!(abi, cuda::Abi::V5 { thread_fields: 0 }));
         // Still a framed byte stream, so records are counted by walking the framing.
         let stream = [9u8, 1, 0, 0, 0, 0, 0, 0, 0, 9, 2, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(m.count_records(&stream), 2);
+        assert_eq!(m.count_records(abi, &stream), 2);
+
+        let m: Manifest =
+            serde_json::from_str(r#"{"out_cap":1048576,"format":5,"thread_fields":3}"#)
+                .expect("v5 manifest with loop dimensions");
+        assert!(matches!(
+            m.abi().expect("v5 is supported"),
+            cuda::Abi::V5 { thread_fields: 3 }
+        ));
     }
 
-    /// Fragment ranges arrive as decimal strings and can exceed 64 bits once a job's
-    /// index does (api.md §1) — parsing must carry the full value, not truncate it.
+    /// v4 was specified and superseded before a single job was dispatched (api.md §6),
+    /// so nothing can legitimately carry it. Its work cell starts with the base index
+    /// where v5's starts with the step count, so running one as the other would compute
+    /// the wrong cells silently — refuse it, and refuse anything newer than v5 too.
+    #[test]
+    fn unsupported_formats_are_refused() {
+        for format in [4u32, 6, 99] {
+            let m: Manifest =
+                serde_json::from_str(&format!(r#"{{"out_cap":4096,"format":{format}}}"#))
+                    .expect("manifest parses");
+            assert!(m.abi().is_err(), "format {format} must be refused");
+        }
+    }
+
+    /// Fragment ranges arrive as decimal strings and routinely exceed 64 bits under v5,
+    /// where they index the box's thread-dimension cells (api.md §1.1) — parsing must
+    /// carry the full value, not truncate it.
     #[test]
     fn fragment_range_parses_past_64_bits() {
-        // A Coldcard Mk4-style index: RTC state 7 in limb 1, pad index 100 in limb 0.
         let base = (7u128 << 64) | 100;
         let f: Fragment = serde_json::from_str(&format!(
             r#"{{"Decrypt_Job_Fragment__":"f","Range_Start":"{base}","Range_End":"{}"}}"#,
