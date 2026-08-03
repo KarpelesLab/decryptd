@@ -138,11 +138,11 @@ struct Fragment {
     /// we're still processing it (so we don't run the same work twice).
     #[serde(rename = "Decrypt_Job_Fragment__")]
     id: String,
-    #[serde(rename = "Range_Start", deserialize_with = "de_u64")]
-    range_start: u64,
+    #[serde(rename = "Range_Start", deserialize_with = "de_u128")]
+    range_start: u128,
     /// Exclusive — the platform's ranges are half-open `[Range_Start, Range_End)`.
-    #[serde(rename = "Range_End", deserialize_with = "de_u64")]
-    range_end: u64,
+    #[serde(rename = "Range_End", deserialize_with = "de_u128")]
+    range_end: u128,
 }
 #[derive(Deserialize)]
 struct Job {
@@ -162,13 +162,18 @@ struct DataRef {
     hash: String,
 }
 
-/// BIGINT columns serialize as JSON strings; accept a number too, just in case.
-fn de_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+/// Fragment ranges are arbitrary-precision decimal strings on the platform (a job's
+/// keyspace can exceed 64 bits — ABI v4 exists for exactly that), so parse them as
+/// `u128`; accept a JSON number too, just in case. `u128` covers a two-limb work
+/// index, which is the widest any current core declares.
+fn de_u128<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u128, D::Error> {
     use serde::de::Error;
     match Value::deserialize(d)? {
         Value::String(s) => s.parse().map_err(Error::custom),
-        Value::Number(n) => n.as_u64().ok_or_else(|| Error::custom("not a u64")),
-        other => Err(Error::custom(format!("expected u64, got {other}"))),
+        Value::Number(n) => n
+            .as_u128()
+            .ok_or_else(|| Error::custom("not a non-negative integer")),
+        other => Err(Error::custom(format!("expected an integer, got {other}"))),
     }
 }
 
@@ -185,10 +190,10 @@ struct Manifest {
     #[serde(default = "d_entry")]
     entry: String,
     /// Output record size in bytes (e.g. 28 = u64 seed + 20-byte address).
-    /// **Pre-v3 only** — a v3 stream is self-delimiting, so v3 manifests omit it.
+    /// **Pre-v3 only** — a v3+ stream is self-delimiting, so those manifests omit it.
     #[serde(default)]
     record_size: u32,
-    /// Output buffer capacity — in *bytes* under v3, in *records* pre-v3.
+    /// Output buffer capacity — in *bytes* under v3/v4, in *records* pre-v3.
     #[serde(default = "d_out_cap")]
     out_cap: u32,
     /// CUDA block size.
@@ -197,8 +202,13 @@ struct Manifest {
     /// Work-items per kernel launch (tiles a large range).
     #[serde(default = "d_tile")]
     tile: u64,
-    /// Output format version: `3` selects the v3 kernel ABI; absent or `< 3` selects
-    /// the legacy fixed-record ABI (CKF api.md §5/§6).
+    /// 64-bit limbs in the work-item index (`nlimbs`, api.md §1) — **v4 only**, and a
+    /// property of the cubin: declare the wrong width and it refuses the job. Absent
+    /// means one limb, the plain 64-bit index every pre-v4 core uses.
+    #[serde(default = "d_index_words")]
+    index_words: u32,
+    /// Output format version: `4` selects the v4 kernel ABI, `3` the v3 one; absent or
+    /// `< 3` selects the legacy fixed-record ABI (api.md §5/§6).
     #[serde(default)]
     format: u32,
 }
@@ -206,12 +216,16 @@ struct Manifest {
 impl Manifest {
     /// Which kernel ABI this job's cubins implement.
     fn abi(&self) -> cuda::Abi {
-        if self.format >= 3 {
-            cuda::Abi::V3
-        } else {
-            cuda::Abi::Legacy {
+        match self.format {
+            0..=2 => cuda::Abi::Legacy {
                 record_size: self.record_size,
-            }
+            },
+            3 => cuda::Abi::V3,
+            // Newer formats are read as v4: its work cell is self-describing, so a
+            // cubin that needs something else rejects the job rather than mis-running.
+            _ => cuda::Abi::V4 {
+                index_words: self.index_words,
+            },
         }
     }
 
@@ -219,7 +233,7 @@ impl Manifest {
     /// telemetry only; decryptd never interprets a record's contents.
     fn count_records(&self, output: &[u8]) -> usize {
         match self.abi() {
-            cuda::Abi::V3 => cuda::count_framed_records(output),
+            cuda::Abi::V3 | cuda::Abi::V4 { .. } => cuda::count_framed_records(output),
             cuda::Abi::Legacy { record_size } => output.len() / record_size.max(1) as usize,
         }
     }
@@ -235,6 +249,9 @@ fn d_block() -> u32 {
 }
 fn d_tile() -> u64 {
     1 << 24
+}
+fn d_index_words() -> u32 {
+    1
 }
 
 // --------------------------------------------------------------------- helpers
@@ -535,8 +552,8 @@ fn unpack_engine(zip_bytes: &[u8]) -> Result<(Manifest, Vec<Cubin>)> {
 /// A fragment that's been claimed and has its blobs downloaded — ready for the GPU.
 struct ReadyJob {
     frag_id: String,
-    start: u64,
-    end: u64,
+    start: u128,
+    end: u128,
     manifest: Manifest,
     /// Arch-tagged cubins, highest arch first (see [`Cubin`]).
     cubins: Vec<Cubin>,
@@ -548,8 +565,8 @@ struct ReadyJob {
 /// A fragment that's finished on the GPU — ready to compress + submit.
 struct FinishedJob {
     frag_id: String,
-    start: u64,
-    end: u64,
+    start: u128,
+    end: u128,
     /// Output records the fragment produced (counted per its ABI) — reported in logs.
     records: usize,
     output: Vec<u8>,
@@ -961,10 +978,12 @@ fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJo
         JOB_TIMEOUT,
         {
             // Feed the tray's rate meter per tile: record the item delta since the
-            // last callback (`done` is cumulative within the fragment).
-            let mut reported = 0u64;
-            move |done, _total| {
-                status.record_tries(done.saturating_sub(reported));
+            // last callback (`done` is cumulative within the fragment). A single
+            // fragment never spans more than a u64 of items, so the delta always fits.
+            let mut reported = 0u128;
+            move |done: u128, _total| {
+                let delta = done.saturating_sub(reported);
+                status.record_tries(u64::try_from(delta).unwrap_or(u64::MAX));
                 reported = done;
             }
         },
@@ -1459,7 +1478,7 @@ mod tests {
     }
 
     /// Pre-v3 manifests (no `format`, or an older one) must still select the legacy
-    /// fixed-record ABI — jobs dispatched before v3 keep draining (CKF api.md §6).
+    /// fixed-record ABI — jobs dispatched before v3 keep draining (api.md §6).
     #[test]
     fn pre_v3_manifest_selects_the_legacy_abi() {
         for src in [
@@ -1474,6 +1493,38 @@ mod tests {
             assert_eq!(m.entry, "decrypt", "entry still defaults");
             assert_eq!(m.count_records(&[0u8; 29 * 3]), 3, "{src}");
         }
+    }
+
+    /// A v4 manifest adds `index_words` — the width of the work-item index its cubins
+    /// were built for. It defaults to one limb (the plain 64-bit index), so a v4
+    /// manifest that omits it behaves exactly like v3 apart from the cell layout.
+    #[test]
+    fn v4_manifest_selects_the_index_width() {
+        let m: Manifest = serde_json::from_str(r#"{"out_cap":1048576,"format":4}"#)
+            .expect("v4 manifest must parse without index_words");
+        assert!(matches!(m.abi(), cuda::Abi::V4 { index_words: 1 }));
+
+        let m: Manifest = serde_json::from_str(r#"{"out_cap":1048576,"format":4,"index_words":2}"#)
+            .expect("v4 manifest with a wide index");
+        assert!(matches!(m.abi(), cuda::Abi::V4 { index_words: 2 }));
+        // Still a framed byte stream, so records are counted by walking the framing.
+        let stream = [9u8, 1, 0, 0, 0, 0, 0, 0, 0, 9, 2, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(m.count_records(&stream), 2);
+    }
+
+    /// Fragment ranges arrive as decimal strings and can exceed 64 bits once a job's
+    /// index does (api.md §1) — parsing must carry the full value, not truncate it.
+    #[test]
+    fn fragment_range_parses_past_64_bits() {
+        // A Coldcard Mk4-style index: RTC state 7 in limb 1, pad index 100 in limb 0.
+        let base = (7u128 << 64) | 100;
+        let f: Fragment = serde_json::from_str(&format!(
+            r#"{{"Decrypt_Job_Fragment__":"f","Range_Start":"{base}","Range_End":"{}"}}"#,
+            base + 4096
+        ))
+        .expect("wide fragment range");
+        assert_eq!(f.range_start, base);
+        assert_eq!(f.range_end, base + 4096);
     }
 
     // The exact inline blob the platform handed back in the field, which rsurl
