@@ -132,22 +132,73 @@ struct Pull {
     #[serde(rename = "Response_Key")]
     response_key: String,
 }
+/// One claimed slice of work. The platform hands out two shapes (`Decrypt/Job:pullOne`):
+/// **bounded** jobs — the v5 ABI's box — carve their range as an odometer run and send
+/// `Start`/`Steps`, while **legacy** jobs keep the original half-open integer span in
+/// `Range_Start`/`Range_End`. Exactly one pair is populated.
 #[derive(Deserialize)]
 struct Fragment {
     /// Fragment UUID — used to detect a fragment the platform re-issued to us while
     /// we're still processing it (so we don't run the same work twice).
     #[serde(rename = "Decrypt_Job_Fragment__")]
     id: String,
-    #[serde(rename = "Range_Start", deserialize_with = "de_u128")]
-    range_start: u128,
-    /// Exclusive — the platform's ranges are half-open `[Range_Start, Range_End)`.
-    #[serde(rename = "Range_End", deserialize_with = "de_u128")]
-    range_end: u128,
+    /// **Bounded** — the odometer position this run starts at: one bare value per axis,
+    /// `"v/v/…"`, leftmost most significant (same spelling as `Job.Bounds`).
+    #[serde(rename = "Start", default)]
+    start: Option<String>,
+    /// **Bounded** — cells to walk from `start`.
+    #[serde(rename = "Steps", default, deserialize_with = "de_opt_u64")]
+    steps: Option<u64>,
+    /// **Legacy** — inclusive low end of the flat index span.
+    #[serde(rename = "Range_Start", default, deserialize_with = "de_opt_u128")]
+    range_start: Option<u128>,
+    /// **Legacy** — exclusive high end; the platform's spans are `[Start, End)`.
+    #[serde(rename = "Range_End", default, deserialize_with = "de_opt_u128")]
+    range_end: Option<u128>,
 }
 #[derive(Deserialize)]
 struct Job {
+    /// **Bounded jobs only** — the work space, `"lo-hi/lo-hi/…"` leftmost most
+    /// significant. One field per axis the tiler walks; the job blob carries the same
+    /// axes for the kernel, so decryptd never has to open it.
+    #[serde(rename = "Bounds", default)]
+    bounds: Option<String>,
     #[serde(rename = "Data", default)]
     data: Vec<DataRef>,
+}
+
+impl Pull {
+    /// The work this fragment covers, in whichever shape its job uses.
+    fn work(&self) -> Result<cuda::Work> {
+        let f = &self.fragment;
+        match (&self.job.bounds, &f.start) {
+            (Some(bounds), Some(start)) => {
+                let bounds = cuda::WorkBox::parse_bounds(bounds).map_err(|e| anyhow!(e))?;
+                let pos = bounds.parse_position(start).map_err(|e| anyhow!(e))?;
+                let steps = f.steps.unwrap_or(0);
+                if steps == 0 {
+                    bail!("bounded fragment {start} has no steps");
+                }
+                Ok(cuda::Work::Odometer { bounds, pos, steps })
+            }
+            // A job that carries only one half of the bounded shape is malformed; do not
+            // fall back to the legacy fields, which would silently run the wrong space.
+            (Some(_), None) => bail!("bounded job gave no fragment Start"),
+            (None, Some(_)) => bail!("fragment has a Start but its job has no Bounds"),
+            (None, None) => {
+                let (Some(start), Some(end)) = (f.range_start, f.range_end) else {
+                    bail!("fragment has neither a bounded run nor a legacy range");
+                };
+                if end <= start {
+                    bail!("empty fragment range [{start}, {end})");
+                }
+                Ok(cuda::Work::Flat {
+                    start,
+                    end_incl: end - 1,
+                })
+            }
+        }
+    }
 }
 #[derive(Deserialize)]
 struct DataRef {
@@ -162,16 +213,33 @@ struct DataRef {
     hash: String,
 }
 
-/// Fragment ranges are arbitrary-precision decimal strings on the platform, so parse
-/// them as `u128`; accept a JSON number too, just in case. A v5 job's keyspace routinely
-/// exceeds 64 bits once its box's axes stack (api.md §1.1), and the range indexes that
-/// box's thread-dimension cells — `u128` covers every box a core declares today.
-fn de_u128<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u128, D::Error> {
+/// A legacy fragment range: a decimal string on the platform (the column is a VARCHAR,
+/// not a BIGINT), though a JSON number is accepted too. `None` when the field is absent
+/// or null, which is how a bounded job's fragment arrives. `u128` rather than `u64`
+/// because the column is arbitrary-precision; the ABI's own 64-bit limit is enforced
+/// where the range is used, with a message that says so.
+fn de_opt_u128<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u128>, D::Error> {
     use serde::de::Error;
     match Value::deserialize(d)? {
-        Value::String(s) => s.parse().map_err(Error::custom),
+        Value::Null => Ok(None),
+        Value::String(s) => s.parse().map(Some).map_err(Error::custom),
         Value::Number(n) => n
             .as_u128()
+            .map(Some)
+            .ok_or_else(|| Error::custom("not a non-negative integer")),
+        other => Err(Error::custom(format!("expected an integer, got {other}"))),
+    }
+}
+
+/// `Fragment.Steps` — cells in a bounded run. Same string-or-number tolerance.
+fn de_opt_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    use serde::de::Error;
+    match Value::deserialize(d)? {
+        Value::Null => Ok(None),
+        Value::String(s) => s.parse().map(Some).map_err(Error::custom),
+        Value::Number(n) => n
+            .as_u64()
+            .map(Some)
             .ok_or_else(|| Error::custom("not a non-negative integer")),
         other => Err(Error::custom(format!("expected an integer, got {other}"))),
     }
@@ -199,14 +267,14 @@ struct Manifest {
     /// CUDA block size.
     #[serde(default = "d_block")]
     block: u32,
-    /// Work-items per kernel launch. Under v5 these are thread-dimension cells of the
-    /// box (api.md §1.3), the same unit the fragment range counts in.
+    /// Work-items per kernel launch. Under v5 these are cells of the job's box
+    /// (api.md §1.3), the same unit a fragment's `Steps` counts in.
     #[serde(default = "d_tile")]
     tile: u64,
-    /// Leading box axes the tiler enumerates (`nthread`, api.md §1.3) — **v5 only**,
-    /// and a property of the cubin, not of the job: declare the wrong count and it
-    /// refuses the job. `0` (absent) means every axis in the blob is a thread
-    /// dimension, which is the shape a core with no amortising inner loop bakes.
+    /// Box axes the tiler enumerates (`nthread`, api.md §1.3) — **v5 only**, and a
+    /// property of the cubin, not of the job. It is redundant with the job's own
+    /// `Bounds`, which is what the work cell declares, so it is only cross-checked
+    /// against them; `0` (absent) skips that check.
     #[serde(default)]
     thread_fields: u32,
     /// Output format version: `5` selects the v5 kernel ABI, `3` the v3 one; absent or
@@ -554,8 +622,8 @@ fn unpack_engine(zip_bytes: &[u8]) -> Result<(Manifest, Vec<Cubin>)> {
 /// A fragment that's been claimed and has its blobs downloaded — ready for the GPU.
 struct ReadyJob {
     frag_id: String,
-    start: u128,
-    end: u128,
+    /// The slice of the job's space this fragment covers.
+    work: cuda::Work,
     manifest: Manifest,
     /// Arch-tagged cubins, highest arch first (see [`Cubin`]).
     cubins: Vec<Cubin>,
@@ -567,8 +635,9 @@ struct ReadyJob {
 /// A fragment that's finished on the GPU — ready to compress + submit.
 struct FinishedJob {
     frag_id: String,
-    start: u128,
-    end: u128,
+    /// How the fragment is named in logs (a flat span, or a start position + length).
+    /// The work itself is done with by this point; only the label is still useful.
+    label: String,
     /// Output records the fragment produced (counted per its ABI) — reported in logs.
     records: usize,
     output: Vec<u8>,
@@ -804,10 +873,7 @@ fn claim_and_fetch(
         return Ok(None);
     };
     let pull: Pull = serde_json::from_value(data.clone()).context("parsing pullOne response")?;
-    let (start, end) = (pull.fragment.range_start, pull.fragment.range_end);
-    if end <= start {
-        bail!("empty fragment range [{start}, {end})");
-    }
+    let work = pull.work()?;
     let frag_id = pull.fragment.id.clone();
 
     // The platform round-robins fragments; with few open fragments it can re-hand us one
@@ -848,8 +914,7 @@ fn claim_and_fetch(
         };
         Ok(ReadyJob {
             frag_id: frag_id.clone(),
-            start,
-            end,
+            work: work.clone(),
             manifest,
             cubins,
             data,
@@ -859,10 +924,7 @@ fn claim_and_fetch(
 
     match fetched {
         Ok(job) => {
-            eprintln!(
-                "[decryptd] GPU#{ordinal} claimed [{start}, {end}) ({} items)",
-                end - start
-            );
+            eprintln!("[decryptd] GPU#{ordinal} claimed {work}");
             Ok(Some(job))
         }
         Err(e) => {
@@ -960,17 +1022,17 @@ fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJo
     let (maj, min) = gpu.compute_capability();
     let cubin_arch = gpu.cubin_arch();
     let gpu_name = gpu.device_name();
+    let label = job.work.to_string();
     eprintln!(
-        "[decryptd] running [{}, {}) on GPU#{ordinal} {gpu_name} (sm_{maj}{min}, cubin sm{cubin_arch}): entry={} abi={abi:?}",
-        job.start, job.end, job.manifest.entry,
+        "[decryptd] running {label} on GPU#{ordinal} {gpu_name} (sm_{maj}{min}, cubin sm{cubin_arch}): entry={} abi={abi:?}",
+        job.manifest.entry,
     );
     let t0 = Instant::now();
     let output = cuda::run_job(
         &gpu,
         &job.manifest.entry,
         &job.data,
-        job.start,
-        job.end - 1, // run_job's range is inclusive
+        &job.work,
         abi,
         job.manifest.out_cap,
         job.manifest.block,
@@ -994,14 +1056,10 @@ fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJo
     .map_err(|e| anyhow!("run_job: {e}"))?;
     let run_secs = t0.elapsed().as_secs_f64();
     let records = job.manifest.count_records(abi, &output);
-    eprintln!(
-        "[decryptd] GPU#{ordinal} ran [{}, {}): {records} record(s) in {run_secs:.1}s",
-        job.start, job.end
-    );
+    eprintln!("[decryptd] GPU#{ordinal} ran {label}: {records} record(s) in {run_secs:.1}s");
     Ok(FinishedJob {
         frag_id: job.frag_id,
-        start: job.start,
-        end: job.end,
+        label,
         records,
         output,
         run_secs,
@@ -1060,8 +1118,8 @@ fn submit_job(
     )
     .map_err(|e| anyhow!("Decrypt/Job:submit: {e}"))?;
     eprintln!(
-        "[decryptd] GPU#{} submitted {records} record(s) ({packed_len} B gzip) for [{}, {}) (ran {:.1}s, dl {:.1}s, {queued} upload(s) in flight)",
-        job.gpu_idx, job.start, job.end, job.run_secs, job.download_secs
+        "[decryptd] GPU#{} submitted {records} record(s) ({packed_len} B gzip) for {} (ran {:.1}s, dl {:.1}s, {queued} upload(s) in flight)",
+        job.gpu_idx, job.label, job.run_secs, job.download_secs
     );
     Ok(())
 }
@@ -1139,10 +1197,9 @@ fn run_loop(
                     Ok(()) => {}
                     Err(TrySendError::Full(finished)) => {
                         eprintln!(
-                            "[decryptd] GPU#{ordinal} upload queue full ({} in flight); waiting to hand off [{}, {}) — GPU idle until a slot frees",
+                            "[decryptd] GPU#{ordinal} upload queue full ({} in flight); waiting to hand off {} — GPU idle until a slot frees",
                             pending.load(Ordering::Relaxed),
-                            finished.start,
-                            finished.end
+                            finished.label,
                         );
                         if done.send(finished).is_err() {
                             pending.fetch_sub(1, Ordering::Relaxed);
@@ -1194,8 +1251,8 @@ fn upload_loop(
                     // An "Access denied" here means the platform already has this
                     // fragment (solved elsewhere): nothing to retry, just drop it.
                     eprintln!(
-                        "[decryptd] GPU#{} submit error for [{}, {}): {e:#}",
-                        job.gpu_idx, job.start, job.end
+                        "[decryptd] GPU#{} submit error for {}: {e:#}",
+                        job.gpu_idx, job.label
                     );
                 }
             }
@@ -1533,19 +1590,86 @@ mod tests {
         }
     }
 
-    /// Fragment ranges arrive as decimal strings and routinely exceed 64 bits under v5,
-    /// where they index the box's thread-dimension cells (api.md §1.1) — parsing must
-    /// carry the full value, not truncate it.
-    #[test]
-    fn fragment_range_parses_past_64_bits() {
-        let base = (7u128 << 64) | 100;
-        let f: Fragment = serde_json::from_str(&format!(
-            r#"{{"Decrypt_Job_Fragment__":"f","Range_Start":"{base}","Range_End":"{}"}}"#,
-            base + 4096
+    fn pull_of(fragment: &str, job: &str) -> Pull {
+        serde_json::from_str(&format!(
+            r#"{{"Fragment":{fragment},"Job":{job},"Response_Key":"k"}}"#
         ))
-        .expect("wide fragment range");
-        assert_eq!(f.range_start, base);
-        assert_eq!(f.range_end, base + 4096);
+        .expect("pullOne response parses")
+    }
+
+    /// A **bounded** job's fragment is a contiguous odometer run: `Start` + `Steps`
+    /// against the job's `Bounds`, with no `Range_End` at all.
+    #[test]
+    fn bounded_pull_becomes_an_odometer_run() {
+        let pull = pull_of(
+            r#"{"Decrypt_Job_Fragment__":"f","Start":"4/1/0","Steps":"65536"}"#,
+            r#"{"Bounds":"4-8/1-255/0-65536","Data":[]}"#,
+        );
+        let work = pull.work().expect("bounded work");
+        let cuda::Work::Odometer { pos, steps, .. } = &work else {
+            panic!("expected an odometer run, got {work:?}");
+        };
+        // Reversed into kernel order: the rightmost wire field is axis 0.
+        assert_eq!(*pos, vec![0, 1, 4]);
+        assert_eq!(*steps, 65536);
+        // Logs read back in the platform's own spelling.
+        assert_eq!(work.to_string(), "4/1/0 +65536");
+    }
+
+    /// **Legacy and v3** jobs keep the original half-open `Range_Start`/`Range_End`
+    /// span, which must still parse and still drive a flat run — those jobs are live.
+    #[test]
+    fn legacy_pull_stays_a_flat_range() {
+        let pull = pull_of(
+            r#"{"Decrypt_Job_Fragment__":"f","Range_Start":"1000","Range_End":"5096"}"#,
+            r#"{"Data":[]}"#,
+        );
+        let work = pull.work().expect("legacy work");
+        assert!(
+            matches!(
+                work,
+                cuda::Work::Flat {
+                    start: 1000,
+                    end_incl: 5095
+                }
+            ),
+            "got {work:?}"
+        );
+        assert_eq!(work.to_string(), "[1000, 5096)");
+
+        // An empty span is a platform bug, not something to launch a kernel over.
+        let empty = pull_of(
+            r#"{"Decrypt_Job_Fragment__":"f","Range_Start":"7","Range_End":"7"}"#,
+            r#"{"Data":[]}"#,
+        );
+        assert!(empty.work().is_err());
+    }
+
+    /// Half a bounded shape must not silently fall through to the legacy fields — that
+    /// would run a completely different space. Same for a fragment carrying neither.
+    #[test]
+    fn mixed_or_missing_pull_shapes_are_refused() {
+        // Bounds but no Start.
+        let a = pull_of(
+            r#"{"Decrypt_Job_Fragment__":"f","Range_Start":"0","Range_End":"9"}"#,
+            r#"{"Bounds":"0-9","Data":[]}"#,
+        );
+        assert!(a.work().is_err(), "bounds without a Start");
+        // Start but no Bounds.
+        let b = pull_of(
+            r#"{"Decrypt_Job_Fragment__":"f","Start":"3","Steps":"4"}"#,
+            r#"{"Data":[]}"#,
+        );
+        assert!(b.work().is_err(), "Start without bounds");
+        // Neither shape.
+        let c = pull_of(r#"{"Decrypt_Job_Fragment__":"f"}"#, r#"{"Data":[]}"#);
+        assert!(c.work().is_err(), "no range at all");
+        // Bounded but with a zero-length run.
+        let d = pull_of(
+            r#"{"Decrypt_Job_Fragment__":"f","Start":"3","Steps":"0"}"#,
+            r#"{"Bounds":"0-9","Data":[]}"#,
+        );
+        assert!(d.work().is_err(), "zero steps");
     }
 
     // The exact inline blob the platform handed back in the field, which rsurl
