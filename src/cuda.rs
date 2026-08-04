@@ -34,7 +34,7 @@
 //! tiling it is just advancing the cursor. Axes that exist only to amortise an expensive
 //! stage across their span are not in the box at all — they are baked as inner loops and
 //! reported in the record's trailing fields — so the box's axis count is the whole story
-//! (api.md §1.3). `start[1]` echoes that count, and a cubin that disagrees with it, or
+//! (api.md §1.4). `start[1]` echoes that count, and a cubin that disagrees with it, or
 //! whose box is wider than it can hold, rejects the job instead of computing garbage.
 //!
 //! **v5 only.** The pre-v5 ABIs are gone: v3 (`[base, resume]`, 64-bit index) and pre-v3
@@ -287,7 +287,7 @@ impl AbiDesc {
 /// It comes from the cubin's own descriptor, where it is a compile-time constant the
 /// device odometer is built around. The axes that exist only to amortise an expensive
 /// stage aren't in it at all — they're baked as inner loops — so its axis count is the
-/// whole story (api.md §1.3).
+/// whole story (api.md §1.4).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkBox {
     axes: Vec<(u64, u64)>,
@@ -295,7 +295,7 @@ pub struct WorkBox {
 
 impl WorkBox {
     /// Build a box from inclusive `(lo, hi)` bounds in kernel order, rejecting what the
-    /// ABI's arithmetic cannot represent (api.md §1.5): `lo <= hi` keeps an axis
+    /// ABI's arithmetic cannot represent (api.md §1.6): `lo <= hi` keeps an axis
     /// non-empty, and `hi < u64::MAX` keeps its radix from overflowing to 0. A box
     /// breaking either would make the odometer silently wrong rather than loudly broken.
     pub fn new(axes: Vec<(u64, u64)>) -> Result<WorkBox, String> {
@@ -390,7 +390,7 @@ impl WorkBox {
         })
     }
 
-    /// Largest radix in the box — the term api.md §1.5 bounds a launch's `count`
+    /// Largest radix in the box — the term api.md §1.6 bounds a launch's `count`
     /// against, so the kernel's per-thread `(r_i - 1) + carry` cannot overflow.
     fn max_radix(&self) -> u128 {
         (0..self.axes.len())
@@ -400,7 +400,7 @@ impl WorkBox {
     }
 
     /// `pos` advanced `delta` cells through the box — the host-side twin of the
-    /// kernel's per-thread decode (api.md §1.4), computed digit-wise so a box past
+    /// kernel's per-thread decode (api.md §1.5), computed digit-wise so a box past
     /// 2^64 stays addressable without ever forming a flat offset.
     ///
     /// `None` means the walk carried off the end of the box, which is what ends a run.
@@ -456,7 +456,7 @@ impl std::fmt::Display for Work {
     }
 }
 
-/// Build the `start` work cell for a launch of `count` cells from `pos` (api.md §1.2):
+/// Build the `start` work cell for a launch of `count` cells from `pos` (api.md §1.3):
 /// `[resume = count, nfields, pos…]`.
 ///
 /// The resume slot is *seeded* by the publisher with the launch's step count and only
@@ -784,9 +784,9 @@ pub fn run_job(
 
     // Cells this fragment covers. A run can never be longer than the whole box, so an
     // over-issued `Steps` is clamped rather than trusted — the odometer's carry stops it
-    // either way (api.md §1.4), but the progress denominator should be honest.
+    // either way (api.md §1.5), but the progress denominator should be honest.
     let total = u128::from(work.steps).min(work.bounds.cells()?);
-    // api.md §1.5 bounds a launch: `count < u64::MAX` keeps the rejection sentinel
+    // api.md §1.6 bounds a launch: `count < u64::MAX` keeps the rejection sentinel
     // unambiguous, and `count <= u64::MAX - max(r_i)` keeps the kernel's per-thread
     // `(r_i - 1) + carry` from overflowing. No real tile comes near either; clamp
     // anyway, since the bound depends on a box we didn't choose.
@@ -1113,7 +1113,7 @@ mod tests {
         let mut alien = good.clone();
         alien[0] ^= 0xff;
         assert!(AbiDesc::parse_bytes(&alien).is_err(), "not a descriptor");
-        // An axis the odometer's arithmetic can't represent (api.md §1.5).
+        // An axis the odometer's arithmetic can't represent (api.md §1.6).
         assert!(
             AbiDesc::parse_bytes(&desc_words(5, 5, &[(0, u64::MAX)])).is_err(),
             "axis ends at u64::MAX"
@@ -1160,7 +1160,7 @@ mod tests {
     }
 
     /// The odometer: axis 0 steps every cell and carries into axis 1, and each digit is
-    /// an absolute axis value — not an offset from the bound (api.md §1.4).
+    /// an absolute axis value — not an offset from the bound (api.md §1.5).
     #[test]
     fn work_box_advances_least_significant_first() {
         // Radices 7 and 10 — `5-11` is axis 0, so it leads and steps fastest. Both are
@@ -1195,7 +1195,7 @@ mod tests {
         assert_eq!(wide.advance(&zero, 95u128.pow(10)), None);
     }
 
-    /// A bounds spec that is malformed, or breaks api.md §1.5, must be a handled error
+    /// A bounds spec that is malformed, or breaks api.md §1.6, must be a handled error
     /// — the odometer would be silently wrong rather than loudly broken.
     #[test]
     fn work_box_rejects_malformed_bounds() {
@@ -1226,7 +1226,7 @@ mod tests {
         assert_eq!(work.to_string(), "4096/200/7 +4096");
     }
 
-    /// The work cell (api.md §1.2) is `[resume, nfields, pos…]`, with `resume` seeded to
+    /// The work cell (api.md §1.3) is `[resume, nfields, pos…]`, with `resume` seeded to
     /// the launch's step count and the cursor in kernel axis order.
     #[test]
     fn work_cell_layout() {

@@ -182,20 +182,27 @@ struct Claim {
 impl Claim {
     /// Resolve the claim against the box the cubin reports, giving the run its cursor.
     ///
-    /// The cubin is the authority, and the only one that can be: its bounds are
-    /// compile-time constants the device odometer is built around, so running against
-    /// anything else would desynchronise host and device. The platform's own copy is
-    /// compared and *warned* about — worth surfacing, because the core only rejects a
-    /// mismatched axis count and would walk a same-arity disagreement quietly — but it
-    /// never blocks the run. A stale `Bounds` on the job row is a bookkeeping problem;
-    /// refusing the fragment over it would idle the fleet for no gain.
+    /// The cubin is the authority — its bounds are compile-time constants the device
+    /// odometer is built around, so it is what the device walks regardless. Where the
+    /// platform also sends its own copy we compare the two element-wise, as api.md §1.2
+    /// asks, because the likeliest cause of a disagreement is a reversed axis order and
+    /// that failure is otherwise silent: every range is individually well-formed, so the
+    /// run would just sweep a space the job never meant. The core can't catch it either
+    /// — it rejects a mismatched axis *count*, never mismatched bounds of the right
+    /// arity.
+    ///
+    /// §1.2 says to refuse on mismatch; we **warn and run the cubin's box** instead, so
+    /// the signal reaches the logs without a stale job row idling the fleet. That is a
+    /// deliberate divergence: it trades a loud stop for a loud message, and keeps its
+    /// value only as long as someone reads them.
     fn resolve(&self, bounds: cuda::WorkBox) -> Result<cuda::Work> {
         if let Some(spec) = &self.bounds {
             match cuda::WorkBox::parse_bounds(spec) {
                 Ok(theirs) if theirs == bounds => {}
                 Ok(_) => eprintln!(
                     "[decryptd] warning: job bounds {spec:?} disagree with the box the \
-                     cubin was built for ({bounds}); running the cubin's"
+                     cubin was built for ({bounds}) — usually a reversed axis order \
+                     (api.md §1.2); running the cubin's"
                 ),
                 Err(e) => eprintln!(
                     "[decryptd] warning: job bounds {spec:?} are unreadable ({e}); \
