@@ -318,11 +318,13 @@ impl WorkBox {
         Ok(WorkBox { axes })
     }
 
-    /// Parse a `Job.Bounds` spec: `"lo-hi/lo-hi/…"`, one field per axis.
+    /// Parse a `Job.Bounds` spec: `"lo-hi/lo-hi/…"`, one field per axis, **axis 0
+    /// first** — the leftmost field is the one that steps every cell and carries right.
     ///
-    /// The platform writes it **leftmost-most-significant** — the rightmost field is
-    /// the one that steps every cell and carries left — which is the reverse of the
-    /// kernel's axis order, so the fields are stored reversed.
+    /// This is the same order the cubin's descriptor uses, and the same order api.md
+    /// uses throughout (§1.4's odometer, §4's advance, §5's `lo[]`/`hi[]`). It has to
+    /// be: the two describe the same box, and reading one of them backwards transposes
+    /// the space rather than failing.
     pub fn parse_bounds(spec: &str) -> Result<WorkBox, String> {
         let mut axes = Vec::new();
         for (i, field) in spec.split('/').enumerate() {
@@ -337,12 +339,11 @@ impl WorkBox {
             };
             axes.push((parse(lo, "low")?, parse(hi, "high")?));
         }
-        axes.reverse(); // most-significant-first on the wire -> axis 0 first here
         WorkBox::new(axes)
     }
 
-    /// Parse a `Fragment.Start` position: one absolute value per axis, in the same
-    /// leftmost-most-significant order as the bounds, and inside them.
+    /// Parse a `Fragment.Start` position: one absolute value per axis, axis 0 first —
+    /// the same order as the bounds — and inside them.
     pub fn parse_position(&self, spec: &str) -> Result<Vec<u64>, String> {
         let mut pos = Vec::with_capacity(self.axes.len());
         for (i, field) in spec.split('/').enumerate() {
@@ -354,12 +355,11 @@ impl WorkBox {
         }
         if pos.len() != self.axes.len() {
             return Err(format!(
-                "start {spec:?} has {} axes but the bounds have {}",
+                "start {spec:?} has {} axes but the box has {}",
                 pos.len(),
                 self.axes.len()
             ));
         }
-        pos.reverse(); // same wire order as the bounds
         for (i, (&p, &(lo, hi))) in pos.iter().zip(&self.axes).enumerate() {
             if p < lo || p > hi {
                 return Err(format!(
@@ -422,13 +422,12 @@ impl WorkBox {
 }
 
 impl std::fmt::Display for WorkBox {
-    /// Rendered the way the platform spells a `Job.Bounds`, most significant axis first,
-    /// so a box read off a cubin can be compared with one by eye.
+    /// Rendered the way a `Job.Bounds` is spelled — axis 0 first — so a box read off a
+    /// cubin can be compared with the platform's copy by eye.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let wire: Vec<String> = self
             .axes
             .iter()
-            .rev()
             .map(|(lo, hi)| format!("{lo}-{hi}"))
             .collect();
         f.write_str(&wire.join("/"))
@@ -448,11 +447,11 @@ pub struct Work {
 }
 
 impl std::fmt::Display for Work {
-    /// How a fragment is named in logs: its start position and length, most-significant
-    /// axis first — the platform's own spelling, so a log line can be matched against a
+    /// How a fragment is named in logs: its start position and length, axis 0 first —
+    /// the platform's own spelling, so a log line can be matched against a
     /// `Decrypt/Job/Fragment` row.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let wire: Vec<String> = self.pos.iter().rev().map(|v| v.to_string()).collect();
+        let wire: Vec<String> = self.pos.iter().map(|v| v.to_string()).collect();
         write!(f, "{} +{}", wire.join("/"), self.steps)
     }
 }
@@ -1069,7 +1068,7 @@ mod tests {
         assert_eq!(d.work_box.nfields(), 3);
         d.check_version().expect("v5 is what this worker runs");
         // Rendered back in the platform's spelling, so it can be diffed against Bounds.
-        assert_eq!(d.work_box.to_string(), "4-8/1-255/0-65536");
+        assert_eq!(d.work_box.to_string(), "0-65536/1-255/4-8");
     }
 
     /// A cubin built against another ABI, or emitting another record format, must be
@@ -1125,47 +1124,50 @@ mod tests {
         );
     }
 
-    /// `Job.Bounds` is written **leftmost most significant** — the rightmost field is
-    /// the one that steps every cell — which is the reverse of the kernel's axis order.
-    /// Getting this backwards would walk the space transposed, so pin it.
+    /// Every wire surface is **axis 0 first** — the leftmost field is the one that steps
+    /// every cell and carries right — matching the cubin's descriptor and api.md
+    /// throughout. A reversal anywhere would walk the space transposed rather than fail,
+    /// so pin the order in both directions.
     #[test]
-    fn work_box_reverses_the_wire_axis_order() {
-        // A `[pad, ssr, tod]` space as the platform spells it: tod steps fastest.
-        let b = WorkBox::parse_bounds("0-4999999/0-254/0-86399").unwrap();
+    fn work_box_keeps_the_wire_axis_order() {
+        // A `[tod, ssr, pad]` space: tod is axis 0, so it comes first and steps fastest.
+        let b = WorkBox::parse_bounds("0-86399/0-254/0-4999999").unwrap();
         assert_eq!(b.nfields(), 3);
-        // Axis 0 is the rightmost field.
         assert_eq!(b.axes, vec![(0, 86_399), (0, 254), (0, 4_999_999)]);
         assert_eq!(b.cells().unwrap(), 86_400 * 255 * 5_000_000);
+        // And back out again unchanged, so a box can be diffed against `Job.Bounds`.
+        assert_eq!(b.to_string(), "0-86399/0-254/0-4999999");
 
         // A single-axis space is the degenerate case.
         let b = WorkBox::parse_bounds("0-999999").unwrap();
         assert_eq!((b.nfields(), b.cells().unwrap()), (1, 1_000_000));
     }
 
-    /// A start position is one bare value per axis, in the same wire order as the
-    /// bounds, and inside them.
+    /// A start position is one bare value per axis, in the same order as the bounds,
+    /// and inside them.
     #[test]
     fn work_box_parses_a_start_position() {
-        let b = WorkBox::parse_bounds("4-8/1-255/0-65536").unwrap();
-        // Reversed to kernel order: axis 0 is the `0-65536` field.
-        assert_eq!(b.parse_position("4/1/0").unwrap(), vec![0, 1, 4]);
-        assert_eq!(b.parse_position("7/200/4096").unwrap(), vec![4096, 200, 7]);
+        let b = WorkBox::parse_bounds("0-65536/1-255/4-8").unwrap();
+        // Straight through: the leftmost value is axis 0's.
+        assert_eq!(b.parse_position("0/1/4").unwrap(), vec![0, 1, 4]);
+        assert_eq!(b.parse_position("4096/200/7").unwrap(), vec![4096, 200, 7]);
 
-        assert!(b.parse_position("4/1").is_err(), "too few axes");
-        assert!(b.parse_position("4/1/0/9").is_err(), "too many axes");
-        assert!(b.parse_position("9/1/0").is_err(), "axis 2 above its bound");
-        assert!(b.parse_position("4/0/0").is_err(), "axis 1 below its bound");
-        assert!(b.parse_position("4-8/1/0").is_err(), "a range, not a value");
+        assert!(b.parse_position("0/1").is_err(), "too few axes");
+        assert!(b.parse_position("0/1/4/9").is_err(), "too many axes");
+        assert!(b.parse_position("0/1/9").is_err(), "axis 2 above its bound");
+        assert!(b.parse_position("0/0/4").is_err(), "axis 1 below its bound");
+        assert!(b.parse_position("0-9/1/4").is_err(), "a range, not a value");
     }
 
-    /// The odometer: axis 0 steps every cell and carries left, and each digit is an
-    /// absolute axis value — not an offset from the bound (api.md §1.4).
+    /// The odometer: axis 0 steps every cell and carries into axis 1, and each digit is
+    /// an absolute axis value — not an offset from the bound (api.md §1.4).
     #[test]
     fn work_box_advances_least_significant_first() {
-        // Radices 7 and 10 (`5-11` steps fastest), both off zero so absolute values show.
-        let b = WorkBox::parse_bounds("100-109/5-11").unwrap();
+        // Radices 7 and 10 — `5-11` is axis 0, so it leads and steps fastest. Both are
+        // off zero so absolute values are visible.
+        let b = WorkBox::parse_bounds("5-11/100-109").unwrap();
         assert_eq!(b.cells().unwrap(), 70);
-        let origin = b.parse_position("100/5").unwrap();
+        let origin = b.parse_position("5/100").unwrap();
         assert_eq!(origin, vec![5, 100]);
         assert_eq!(b.advance(&origin, 0), Some(vec![5, 100]));
         assert_eq!(b.advance(&origin, 1), Some(vec![6, 100])); // axis 0 steps
@@ -1176,7 +1178,7 @@ mod tests {
         assert_eq!(b.advance(&origin, 70), None);
 
         // Advancing from mid-box, not just the origin.
-        let mid = b.parse_position("103/9").unwrap();
+        let mid = b.parse_position("9/103").unwrap();
         assert_eq!(b.advance(&mid, 3), Some(vec![5, 104]));
 
         // A box far past 2^64 stays addressable — no flat offset is ever formed. Ten
@@ -1214,22 +1216,22 @@ mod tests {
     /// matched against a `Decrypt/Job/Fragment` row.
     #[test]
     fn work_labels_match_the_wire_spelling() {
-        let bounds = WorkBox::parse_bounds("4-8/1-255/0-65536").unwrap();
-        let pos = bounds.parse_position("7/200/4096").unwrap();
+        let bounds = WorkBox::parse_bounds("0-65536/1-255/4-8").unwrap();
+        let pos = bounds.parse_position("4096/200/7").unwrap();
         let work = Work {
             bounds,
             pos,
             steps: 4096,
         };
-        assert_eq!(work.to_string(), "7/200/4096 +4096");
+        assert_eq!(work.to_string(), "4096/200/7 +4096");
     }
 
     /// The work cell (api.md §1.2) is `[resume, nfields, pos…]`, with `resume` seeded to
     /// the launch's step count and the cursor in kernel axis order.
     #[test]
     fn work_cell_layout() {
-        let b = WorkBox::parse_bounds("100-109/5-11").unwrap();
-        let origin = b.parse_position("100/5").unwrap();
+        let b = WorkBox::parse_bounds("5-11/100-109").unwrap();
+        let origin = b.parse_position("5/100").unwrap();
         // 12 cells in: axis 0 (radix 7) wrapped once, so axis 1 is at 101.
         let cursor = b.advance(&origin, 12).unwrap();
         assert_eq!(cursor, vec![10, 101]);
