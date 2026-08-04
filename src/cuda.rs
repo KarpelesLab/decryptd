@@ -8,7 +8,7 @@
 //! extern "C" __global__ void <entry>(
 //!     unsigned long long* start,   // in/out: the work cell, 2 + nfields x u64
 //!     unsigned long long count,    // box cells (odometer steps) in this launch
-//!     const unsigned char* data,   // the job data blob (device) — carries the box
+//!     const unsigned char* data,   // job data blob (device): algo params, no work data
 //!     unsigned long long data_len,
 //!     unsigned char* out,          // output byte-stream buffer (device)
 //!     unsigned int* out_count,     // atomic BYTE cursor
@@ -22,22 +22,26 @@
 //! cursor instead of an index, and the resume watermark counts *steps of this launch*
 //! rather than naming an absolute position.
 //!
-//! The platform hands the box to decryptd directly, as `Job.Bounds` alongside each
-//! fragment's `Start`/`Steps`, so a fragment is a contiguous run in the kernel's own
-//! walk order and tiling it is just advancing the cursor. The job blob carries the same
-//! axes for the kernel's carry arithmetic — decryptd never opens it. Axes that exist
-//! only to amortise an expensive stage across their span are not in the box at all:
-//! they are baked into the cubin as inner loops and reported in the record's trailing
-//! fields, so the box's axis count is the whole story (api.md §1.3).
+//! **The cubin describes itself** (api.md §5). Its box is a compile-time constant — the
+//! device odometer is built around those literals — so there is no manifest and nothing
+//! else to consult: a second copy could disagree with the baked one, and a disagreement
+//! would not fail, it would quietly walk a different space. After loading a module we
+//! read its descriptor global (see [`AbiDesc`]) and take the box from there. What the
+//! descriptor does *not* carry — the output buffer size, the tile, the block size — are
+//! this runner's own choices, not properties of the job.
 //!
-//! `start[1]` echoes that count, and a cubin whose blob disagrees — or whose box is
-//! wider than it can hold — rejects the job instead of computing garbage.
+//! A fragment is then a contiguous run in that box: a start cursor and a step count, so
+//! tiling it is just advancing the cursor. Axes that exist only to amortise an expensive
+//! stage across their span are not in the box at all — they are baked as inner loops and
+//! reported in the record's trailing fields — so the box's axis count is the whole story
+//! (api.md §1.3). `start[1]` echoes that count, and a cubin that disagrees with it, or
+//! whose box is wider than it can hold, rejects the job instead of computing garbage.
 //!
 //! **v5 only.** The pre-v5 ABIs are gone: v3 (`[base, resume]`, 64-bit index) and pre-v3
 //! (`start` by value, `out_count`/`out_cap` in fixed-size records) are no longer run,
-//! and v4 was superseded before any job was dispatched. A manifest whose `format` is not
-//! 5, or a fragment carved as a flat range, is refused rather than misread — every one
-//! of those seeded a differently shaped work cell.
+//! and v4 was superseded before any job was dispatched. A cubin reporting any of them,
+//! or a fragment carved as a flat range, is refused rather than misread — every one of
+//! those seeded a differently shaped work cell.
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr;
@@ -67,6 +71,14 @@ unsafe extern "C" {
     fn cuModuleUnload(module: CuModule) -> CuResult;
     fn cuModuleGetFunction(
         func: *mut CuFunction,
+        module: CuModule,
+        name: *const c_char,
+    ) -> CuResult;
+    // Reads a `__device__` global out of a loaded module, with its size — how the ABI
+    // descriptor is retrieved (see [`AbiDesc`]).
+    fn cuModuleGetGlobal_v2(
+        dptr: *mut CuDeviceptr,
+        bytes: *mut usize,
         module: CuModule,
         name: *const c_char,
     ) -> CuResult;
@@ -168,39 +180,152 @@ impl Drop for DeviceBuf {
 const MAX_BOX_FIELDS: usize = 64;
 
 /// Written to the resume slot by a cubin that cannot run the job — the `nfields` we
-/// declared is not the one its blob carries, or the box has more axes than it can hold
+/// declared is not the one it was built for, or the box has more axes than it can hold
 /// (api.md §4). Unambiguous because a launch's `count` is always below it, so it can
 /// never be confused with a buffer-full watermark.
 const ABI_REJECT: u64 = u64::MAX;
 
+/// Name of the `__device__` global every cubin carries to describe itself (api.md §5),
+/// and the magic word it opens with (`"JABI"`). Both are wire surface, deliberately
+/// naming neither the producer nor the consumer: a runner looks the symbol up by this
+/// exact string knowing nothing else about the cubin. NUL-terminated for the driver.
+const DESC_SYMBOL: &[u8] = b"job_abi_desc\0";
+const DESC_MAGIC: u64 = 0x4942_414a;
+
+/// Job ABI version and output record format this worker speaks. A cubin reporting
+/// anything else is refused — every older ABI seeded a differently shaped work cell.
+const ABI_VERSION: u64 = 5;
+const REC_FORMAT: u64 = 5;
+
+/// What a cubin says about itself, read back from its descriptor global (api.md §5).
+///
+/// There is no manifest: the work box is a compile-time constant in the cubin, so any
+/// second copy could disagree with the baked one — and a disagreement wouldn't fail, it
+/// would silently walk a different space. Asking the cubin is the only source that
+/// cannot drift.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AbiDesc {
+    pub abi_version: u64,
+    pub rec_format: u64,
+    pub work_box: WorkBox,
+}
+
+impl AbiDesc {
+    /// Decode the descriptor's raw bytes: `4 + 2*nfields` little-endian `u64` words of
+    /// `[magic, abi_version, rec_format, nfields, lo…, hi…]`.
+    ///
+    /// Every field is checked against the symbol's own length, so a torn read or a cubin
+    /// from another ABI is an error rather than a plausible-looking box.
+    pub fn parse_bytes(b: &[u8]) -> Result<AbiDesc, String> {
+        if !b.len().is_multiple_of(8) {
+            return Err(format!(
+                "ABI descriptor is {} bytes, not a whole number of u64 words",
+                b.len()
+            ));
+        }
+        let words: Vec<u64> = b
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        if words.len() < 4 {
+            return Err(format!(
+                "ABI descriptor needs at least 4 words, got {}",
+                words.len()
+            ));
+        }
+        if words[0] != DESC_MAGIC {
+            return Err(format!(
+                "ABI descriptor magic {:#x} is not {DESC_MAGIC:#x}",
+                words[0]
+            ));
+        }
+        let nfields = words[3] as usize;
+        if nfields == 0 || nfields > MAX_BOX_FIELDS {
+            return Err(format!(
+                "ABI descriptor declares {nfields} box axes (expected 1..={MAX_BOX_FIELDS})"
+            ));
+        }
+        if words.len() != 4 + 2 * nfields {
+            return Err(format!(
+                "ABI descriptor declares {nfields} axes, implying {} words, but the symbol \
+                 is {} words",
+                4 + 2 * nfields,
+                words.len()
+            ));
+        }
+        let axes = (0..nfields)
+            .map(|i| (words[4 + i], words[4 + nfields + i]))
+            .collect();
+        Ok(AbiDesc {
+            abi_version: words[1],
+            rec_format: words[2],
+            work_box: WorkBox::new(axes)?,
+        })
+    }
+
+    /// Refuse a cubin built against an ABI this worker doesn't run.
+    pub fn check_version(&self) -> Result<(), String> {
+        if self.abi_version != ABI_VERSION {
+            return Err(format!(
+                "cubin implements job ABI v{}, not the v{ABI_VERSION} this worker runs",
+                self.abi_version
+            ));
+        }
+        if self.rec_format != REC_FORMAT {
+            return Err(format!(
+                "cubin emits record format v{}, not the v{REC_FORMAT} this worker reads",
+                self.rec_format
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The axes of a job's work space: one inclusive `[lo, hi]` range each, held in
 /// **kernel order** — axis 0 first, cycling fastest (api.md §2).
 ///
-/// This comes from the platform's `Job.Bounds`, so decryptd never opens the job blob.
-/// The blob carries the same axes for the kernel's own carry arithmetic; the axes that
-/// amortise an expensive stage are baked into the cubin as inner loops and are not part
-/// of the box at all, so its axis count is the whole story (api.md §1.3).
+/// It comes from the cubin's own descriptor, where it is a compile-time constant the
+/// device odometer is built around. The axes that exist only to amortise an expensive
+/// stage aren't in it at all — they're baked as inner loops — so its axis count is the
+/// whole story (api.md §1.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkBox {
     axes: Vec<(u64, u64)>,
 }
 
 impl WorkBox {
-    /// Parse a `Job.Bounds` spec: `"lo-hi/lo-hi/…"`, one field per thread axis.
+    /// Build a box from inclusive `(lo, hi)` bounds in kernel order, rejecting what the
+    /// ABI's arithmetic cannot represent (api.md §1.5): `lo <= hi` keeps an axis
+    /// non-empty, and `hi < u64::MAX` keeps its radix from overflowing to 0. A box
+    /// breaking either would make the odometer silently wrong rather than loudly broken.
+    pub fn new(axes: Vec<(u64, u64)>) -> Result<WorkBox, String> {
+        if axes.is_empty() || axes.len() > MAX_BOX_FIELDS {
+            return Err(format!(
+                "work box has {} axes (expected 1..={MAX_BOX_FIELDS})",
+                axes.len()
+            ));
+        }
+        for (i, &(lo, hi)) in axes.iter().enumerate() {
+            if lo > hi {
+                return Err(format!("work box axis {i} is empty: {lo} > {hi}"));
+            }
+            if hi == u64::MAX {
+                return Err(format!(
+                    "work box axis {i} ends at u64::MAX; it must be split"
+                ));
+            }
+        }
+        Ok(WorkBox { axes })
+    }
+
+    /// Parse a `Job.Bounds` spec: `"lo-hi/lo-hi/…"`, one field per axis.
     ///
     /// The platform writes it **leftmost-most-significant** — the rightmost field is
     /// the one that steps every cell and carries left — which is the reverse of the
     /// kernel's axis order, so the fields are stored reversed.
     pub fn parse_bounds(spec: &str) -> Result<WorkBox, String> {
-        let fields: Vec<&str> = spec.split('/').collect();
-        if fields.is_empty() || fields.len() > MAX_BOX_FIELDS {
-            return Err(format!(
-                "bounds {spec:?} has {} axes (expected 1..={MAX_BOX_FIELDS})",
-                fields.len()
-            ));
-        }
-        let mut axes = Vec::with_capacity(fields.len());
-        for (i, field) in fields.iter().enumerate() {
+        let mut axes = Vec::new();
+        for (i, field) in spec.split('/').enumerate() {
             let f = field.trim();
             let (lo, hi) = f
                 .split_once('-')
@@ -210,22 +335,10 @@ impl WorkBox {
                     .parse::<u64>()
                     .map_err(|e| format!("bounds axis {i} {what} {s:?}: {e}"))
             };
-            let (lo, hi) = (parse(lo, "low")?, parse(hi, "high")?);
-            // api.md §1.5: `lo <= hi` keeps the axis non-empty, and `hi < u64::MAX`
-            // keeps its radix from overflowing to 0. A spec breaking either would make
-            // the odometer silently wrong rather than loudly broken.
-            if lo > hi {
-                return Err(format!("bounds axis {i} is empty: {lo} > {hi}"));
-            }
-            if hi == u64::MAX {
-                return Err(format!(
-                    "bounds axis {i} ends at u64::MAX; it must be split"
-                ));
-            }
-            axes.push((lo, hi));
+            axes.push((parse(lo, "low")?, parse(hi, "high")?));
         }
         axes.reverse(); // most-significant-first on the wire -> axis 0 first here
-        Ok(WorkBox { axes })
+        WorkBox::new(axes)
     }
 
     /// Parse a `Fragment.Start` position: one absolute value per axis, in the same
@@ -269,8 +382,7 @@ impl WorkBox {
         u128::from(hi - lo) + 1
     }
 
-    /// Total cells in the box — the unit `Fragment.Steps` and the manifest's `tile`
-    /// count in.
+    /// Total cells in the box — the unit `Fragment.Steps` and the tile size count in.
     pub fn cells(&self) -> Result<u128, String> {
         (0..self.axes.len()).try_fold(1u128, |acc, i| {
             acc.checked_mul(self.radix(i))
@@ -309,8 +421,22 @@ impl WorkBox {
     }
 }
 
+impl std::fmt::Display for WorkBox {
+    /// Rendered the way the platform spells a `Job.Bounds`, most significant axis first,
+    /// so a box read off a cubin can be compared with one by eye.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let wire: Vec<String> = self
+            .axes
+            .iter()
+            .rev()
+            .map(|(lo, hi)| format!("{lo}-{hi}"))
+            .collect();
+        f.write_str(&wire.join("/"))
+    }
+}
+
 /// The work a claimed fragment covers: `steps` cells of `bounds`' odometer starting at
-/// `pos` (`Decrypt/Job:pullOne` hands these out as `Start`/`Steps` beside `Job.Bounds`).
+/// `pos`. The platform issues the `Start`/`Steps`; `bounds` comes from the cubin.
 ///
 /// A fragment is a *contiguous run* in the kernel's own walk order, so tiling it is
 /// just advancing the cursor.
@@ -548,6 +674,39 @@ impl Gpu {
         self.arch
     }
 
+    /// Read what the loaded cubin says about itself (api.md §5) — the ABI it implements
+    /// and the work box it was compiled for. This is the only description of the job:
+    /// there is no manifest, because a second copy of a baked-in constant could disagree
+    /// with it and would walk a different space rather than fail.
+    ///
+    /// The driver reports the symbol's own size, so the declared axis count is checked
+    /// against the bytes actually there before anything is indexed.
+    pub fn abi_desc(&self) -> Result<AbiDesc, String> {
+        let (mut dptr, mut len): (CuDeviceptr, usize) = (0, 0);
+        check(
+            unsafe {
+                cuModuleGetGlobal_v2(
+                    &mut dptr,
+                    &mut len,
+                    self.module,
+                    DESC_SYMBOL.as_ptr() as *const c_char,
+                )
+            },
+            // A cubin without the symbol isn't one this worker can describe, let alone run.
+            "cuModuleGetGlobal(job_abi_desc) — cubin carries no ABI descriptor",
+        )?;
+        // Bound the read: a plausible descriptor is a few dozen words, and `len` comes
+        // from the module rather than from anything we validated.
+        if len == 0 || len > 8 * (4 + 2 * MAX_BOX_FIELDS) {
+            return Err(format!(
+                "ABI descriptor symbol is {len} bytes, out of range"
+            ));
+        }
+        let mut buf = vec![0u8; len];
+        DeviceBufView { ptr: dptr, len }.dtoh(&mut buf)?;
+        AbiDesc::parse_bytes(&buf)
+    }
+
     fn function(&self, name: &str) -> Result<CuFunction, String> {
         let cname = CString::new(name).map_err(|e| e.to_string())?;
         let mut f: CuFunction = ptr::null_mut();
@@ -606,15 +765,14 @@ pub fn run_job(
     mut progress: impl FnMut(u128, u128),
     gate: impl Fn(),
 ) -> Result<Vec<u8>, String> {
-    // Validate the publisher-supplied launch params up front: a bad manifest is a
-    // handled error, never a panic (a panic here unwinds the runner thread and takes
-    // the whole daemon down). `block == 0` would divide-by-zero below; a zero cap makes
-    // the output buffer meaningless.
+    // Validate the launch params up front: a bad one is a handled error, never a panic
+    // (a panic here unwinds the runner thread and takes the whole daemon down).
+    // `block == 0` would divide-by-zero below; a zero cap makes the buffer meaningless.
     if block == 0 {
-        return Err("manifest block size is 0".into());
+        return Err("block size is 0".into());
     }
     if out_cap == 0 {
-        return Err("manifest out_cap is 0".into());
+        return Err("out_cap is 0".into());
     }
 
     let func = gpu.function(entry)?;
@@ -631,8 +789,8 @@ pub fn run_job(
     let total = u128::from(work.steps).min(work.bounds.cells()?);
     // api.md §1.5 bounds a launch: `count < u64::MAX` keeps the rejection sentinel
     // unambiguous, and `count <= u64::MAX - max(r_i)` keeps the kernel's per-thread
-    // `(r_i - 1) + carry` from overflowing. No real tile comes near either, but a
-    // manifest is publisher input — clamp it rather than trust it.
+    // `(r_i - 1) + carry` from overflowing. No real tile comes near either; clamp
+    // anyway, since the bound depends on a box we didn't choose.
     let tile_cap =
         u64::try_from(u128::from(u64::MAX) - work.bounds.max_radix()).unwrap_or(u64::MAX - 1);
     let tile = tile.clamp(1, tile_cap.max(1));
@@ -890,6 +1048,81 @@ mod tests {
         let buf = vec![0xffu8; 32];
         assert_eq!(framed_len(&buf), 0);
         assert_eq!(count_framed_records(&buf), 0);
+    }
+
+    /// Build the descriptor words a cubin carries (api.md §5), then their raw bytes.
+    fn desc_words(abi: u64, rec: u64, axes: &[(u64, u64)]) -> Vec<u8> {
+        let mut w = vec![DESC_MAGIC, abi, rec, axes.len() as u64];
+        w.extend(axes.iter().map(|a| a.0));
+        w.extend(axes.iter().map(|a| a.1));
+        w.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    /// A cubin describes itself: magic, the ABI it implements, the record format it
+    /// emits, and the box it was compiled for — `lo[]` then `hi[]`, axis 0 first.
+    #[test]
+    fn abi_descriptor_decodes_a_cubins_box() {
+        let axes = [(0u64, 65536u64), (1, 255), (4, 8)];
+        let d = AbiDesc::parse_bytes(&desc_words(5, 5, &axes)).expect("descriptor decodes");
+        assert_eq!((d.abi_version, d.rec_format), (5, 5));
+        assert_eq!(d.work_box.axes, axes.to_vec());
+        assert_eq!(d.work_box.nfields(), 3);
+        d.check_version().expect("v5 is what this worker runs");
+        // Rendered back in the platform's spelling, so it can be diffed against Bounds.
+        assert_eq!(d.work_box.to_string(), "4-8/1-255/0-65536");
+    }
+
+    /// A cubin built against another ABI, or emitting another record format, must be
+    /// refused — its work cell is a different shape and would compute the wrong cells.
+    #[test]
+    fn abi_descriptor_refuses_other_versions() {
+        let axes = [(0u64, 9u64)];
+        for abi in [3u64, 4, 6] {
+            let d = AbiDesc::parse_bytes(&desc_words(abi, 5, &axes)).unwrap();
+            assert!(d.check_version().is_err(), "ABI v{abi} must be refused");
+        }
+        let d = AbiDesc::parse_bytes(&desc_words(5, 4, &axes)).unwrap();
+        assert!(
+            d.check_version().is_err(),
+            "record format v4 must be refused"
+        );
+    }
+
+    /// The symbol's own length is what bounds the decode, so a torn read or a foreign
+    /// symbol is an error rather than a plausible-looking box.
+    #[test]
+    fn abi_descriptor_rejects_malformed_symbols() {
+        let axes = [(0u64, 9u64), (0, 9)];
+        let good = desc_words(5, 5, &axes);
+        assert!(AbiDesc::parse_bytes(&good).is_ok());
+
+        assert!(AbiDesc::parse_bytes(&[]).is_err(), "empty symbol");
+        assert!(
+            AbiDesc::parse_bytes(&good[..good.len() - 1]).is_err(),
+            "not whole words"
+        );
+        assert!(
+            AbiDesc::parse_bytes(&good[..24]).is_err(),
+            "truncated to 3 words"
+        );
+        // nfields says 2 axes but only one pair follows.
+        assert!(
+            AbiDesc::parse_bytes(&good[..good.len() - 16]).is_err(),
+            "short box"
+        );
+        // Wrong magic: some other module global that happens to be u64-sized.
+        let mut alien = good.clone();
+        alien[0] ^= 0xff;
+        assert!(AbiDesc::parse_bytes(&alien).is_err(), "not a descriptor");
+        // An axis the odometer's arithmetic can't represent (api.md §1.5).
+        assert!(
+            AbiDesc::parse_bytes(&desc_words(5, 5, &[(0, u64::MAX)])).is_err(),
+            "axis ends at u64::MAX"
+        );
+        assert!(
+            AbiDesc::parse_bytes(&desc_words(5, 5, &[(9, 0)])).is_err(),
+            "empty axis"
+        );
     }
 
     /// `Job.Bounds` is written **leftmost most significant** — the rightmost field is

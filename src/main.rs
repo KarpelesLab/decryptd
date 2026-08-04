@@ -13,9 +13,10 @@
 //!   2. downloads the job's blobs (`engine.zip` + an optional compressed `data`
 //!      blob — xz or gzip, auto-detected) from the inline URLs the pull
 //!      response carries,
-//!   3. reads launch parameters from `manifest.json` inside `engine.zip`, loads the
-//!      cubin for the local GPU, and launches its kernel over the fragment's slice of
-//!      the job's work space (the kernel does all the real work and writes output
+//!   3. loads the cubin for the local GPU out of `engine.zip` and asks it what it is —
+//!      the ABI it implements and the work space it walks; there is no manifest, the
+//!      cubin is the only description — then launches its kernel over the fragment's
+//!      slice of that space (the kernel does all the real work and writes output
 //!      records),
 //!   4. gathers the output records, compresses them (gzip), and submits them back with
 //!      `Decrypt/Job:submit`.
@@ -156,31 +157,86 @@ struct Fragment {
 }
 #[derive(Deserialize)]
 struct Job {
-    /// The work space, `"lo-hi/lo-hi/…"` leftmost most significant — one field per box
-    /// axis. The job blob carries the same axes for the kernel, so decryptd never has
-    /// to open it.
+    /// The platform's copy of the work space, `"lo-hi/lo-hi/…"` leftmost most
+    /// significant. The cubin is the authority (api.md §5) — this is cross-checked
+    /// against it so a job created over a different space than the cubin was built for
+    /// is caught rather than silently walked.
     #[serde(rename = "Bounds", default)]
     bounds: Option<String>,
     #[serde(rename = "Data", default)]
     data: Vec<DataRef>,
 }
 
+/// A fragment's claim, in the platform's own words. It cannot become a [`cuda::Work`]
+/// until the cubin is loaded, because the values are positions in a box only the cubin
+/// describes (api.md §5).
+struct Claim {
+    /// `Fragment.Start` — one bare value per axis, leftmost most significant.
+    start: String,
+    /// `Fragment.Steps` — cells to walk from `start`.
+    steps: u64,
+    /// `Job.Bounds`, kept for the cross-check against the cubin's own box.
+    bounds: Option<String>,
+}
+
+impl Claim {
+    /// Resolve the claim against the box the cubin reports, giving the run its cursor.
+    ///
+    /// The cubin is the authority, and the only one that can be: its bounds are
+    /// compile-time constants the device odometer is built around, so running against
+    /// anything else would desynchronise host and device. The platform's own copy is
+    /// compared and *warned* about — worth surfacing, because the core only rejects a
+    /// mismatched axis count and would walk a same-arity disagreement quietly — but it
+    /// never blocks the run. A stale `Bounds` on the job row is a bookkeeping problem;
+    /// refusing the fragment over it would idle the fleet for no gain.
+    fn resolve(&self, bounds: cuda::WorkBox) -> Result<cuda::Work> {
+        if let Some(spec) = &self.bounds {
+            match cuda::WorkBox::parse_bounds(spec) {
+                Ok(theirs) if theirs == bounds => {}
+                Ok(_) => eprintln!(
+                    "[decryptd] warning: job bounds {spec:?} disagree with the box the \
+                     cubin was built for ({bounds}); running the cubin's"
+                ),
+                Err(e) => eprintln!(
+                    "[decryptd] warning: job bounds {spec:?} are unreadable ({e}); \
+                     running the cubin's box ({bounds})"
+                ),
+            }
+        }
+        let pos = bounds.parse_position(&self.start).map_err(|e| anyhow!(e))?;
+        Ok(cuda::Work {
+            bounds,
+            pos,
+            steps: self.steps,
+        })
+    }
+}
+
+impl std::fmt::Display for Claim {
+    /// How a fragment is named in logs, before its box is known.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} +{}", self.start, self.steps)
+    }
+}
+
 impl Pull {
-    /// The work this fragment covers.
-    fn work(&self) -> Result<cuda::Work> {
-        let (Some(bounds), Some(start)) = (&self.job.bounds, &self.fragment.start) else {
+    /// What this fragment claims, validated as far as it can be without the cubin.
+    fn claim(&self) -> Result<Claim> {
+        let Some(start) = self.fragment.start.clone() else {
             bail!(
-                "fragment is not a bounded (v5) run — this worker only runs v5 jobs \
+                "fragment carries no Start — this worker only runs v5 bounded jobs \
                  (api.md §1)"
             );
         };
-        let bounds = cuda::WorkBox::parse_bounds(bounds).map_err(|e| anyhow!(e))?;
-        let pos = bounds.parse_position(start).map_err(|e| anyhow!(e))?;
         let steps = self.fragment.steps.unwrap_or(0);
         if steps == 0 {
-            bail!("bounded fragment {start} has no steps");
+            bail!("fragment {start} has no steps");
         }
-        Ok(cuda::Work { bounds, pos, steps })
+        Ok(Claim {
+            start,
+            steps,
+            bounds: self.job.bounds.clone(),
+        })
     }
 }
 #[derive(Deserialize)]
@@ -217,64 +273,21 @@ fn de_opt_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::
 /// `X*10+Y` (matching the `smNN` filename tag), paired with the raw cubin bytes.
 type Cubin = (u32, Vec<u8>);
 
-/// `manifest.json` shipped inside `engine.zip` — the generic kernel launch
-/// parameters that the platform's Decrypt/Job row does not carry.
-#[derive(Deserialize)]
-struct Manifest {
-    /// Kernel entry-point symbol name.
-    #[serde(default = "d_entry")]
-    entry: String,
-    /// Output buffer capacity in bytes. There is no `record_size` — a v5 stream is
-    /// self-delimiting and decryptd is byte-oriented (api.md §5).
-    #[serde(default = "d_out_cap")]
-    out_cap: u32,
-    /// CUDA block size.
-    #[serde(default = "d_block")]
-    block: u32,
-    /// Box cells per kernel launch — the same unit a fragment's `Steps` counts in.
-    #[serde(default = "d_tile")]
-    tile: u64,
-    /// Output format version. Only `5` runs here: this worker dropped the pre-v5 ABIs,
-    /// and v4 was never dispatched at all (api.md §5/§6).
-    #[serde(default)]
-    format: u32,
-}
+// ------------------------------------------------------- launch parameters
+// There is no manifest (api.md §5): a cubin describes itself, and everything it does
+// *not* describe is this worker's own choice rather than a property of the job. All
+// three below are safe to get wrong — under-sizing any of them costs throughput, never
+// results, because the resume watermark continues exactly where a launch stopped.
 
-/// The only kernel ABI this worker speaks (api.md §1).
-const ABI_FORMAT: u32 = 5;
-
-impl Manifest {
-    /// Reject a job whose cubins don't implement the ABI this worker runs. Every older
-    /// format addressed work by a flat index and seeded a differently shaped work cell,
-    /// so running one as v5 would compute the wrong cells silently rather than fail.
-    fn check_format(&self) -> Result<()> {
-        if self.format != ABI_FORMAT {
-            bail!(
-                "manifest format {} is not the v{ABI_FORMAT} ABI this worker runs",
-                self.format
-            );
-        }
-        Ok(())
-    }
-
-    /// Number of output records in a finished fragment's buffer — for logs and submit
-    /// telemetry only; decryptd never interprets a record's contents.
-    fn count_records(&self, output: &[u8]) -> usize {
-        cuda::count_framed_records(output)
-    }
-}
-fn d_entry() -> String {
-    "decrypt".into()
-}
-fn d_out_cap() -> u32 {
-    1 << 24
-}
-fn d_block() -> u32 {
-    256
-}
-fn d_tile() -> u64 {
-    1 << 24
-}
+/// Kernel entry point. Always `decrypt`; it is part of the ABI, not per-job.
+const ENTRY: &str = "decrypt";
+/// Output buffer capacity in bytes. There is no `record_size` — the stream is
+/// self-delimiting and decryptd is byte-oriented.
+const OUT_CAP: u32 = 1 << 24;
+/// CUDA block size.
+const BLOCK: u32 = 256;
+/// Box cells per launch — the same unit a fragment's `Steps` counts in.
+const TILE: u64 = 1 << 24;
 
 // --------------------------------------------------------------------- helpers
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -538,22 +551,20 @@ fn percent_decode(s: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Unpack engine.zip: parse `manifest.json` and collect every `*.sm<NN>.cubin` as
-/// an `(arch, bytes)` pair, highest compute-capability first. The arch tag rides
-/// along so the GPU loader can skip cubins newer than the device (see
-/// [`cuda::Gpu::load_first`]) instead of handing them to a driver that may crash.
-fn unpack_engine(zip_bytes: &[u8]) -> Result<(Manifest, Vec<Cubin>)> {
+/// Unpack engine.zip: collect every `*.sm<NN>.cubin` as an `(arch, bytes)` pair,
+/// highest compute-capability first. The arch tag rides along so the GPU loader can skip
+/// cubins newer than the device (see [`cuda::Gpu::load_first`]) instead of handing them
+/// to a driver that may crash.
+fn unpack_engine(zip_bytes: &[u8]) -> Result<Vec<Cubin>> {
     let mut zip = zip::ZipArchive::new(Cursor::new(zip_bytes)).context("opening engine.zip")?;
-    let mut manifest: Option<Manifest> = None;
     let mut cubins: Vec<(u32, Vec<u8>)> = Vec::new();
     for i in 0..zip.len() {
         let mut f = zip.by_index(i)?;
         let name = f.name().rsplit('/').next().unwrap_or(f.name()).to_string();
-        if name == "manifest.json" {
-            let mut s = String::new();
-            f.read_to_string(&mut s)?;
-            manifest = Some(serde_json::from_str(&s).context("parsing manifest.json")?);
-        } else if let Some(i) = name.find(".sm")
+        // Cubins are all we take. Anything else in the archive — including a
+        // `manifest.json` from before the cubin described itself (api.md §5) — is
+        // ignored: a second copy of a baked-in constant could only disagree with it.
+        if let Some(i) = name.find(".sm")
             && let Some(rest) = name[i + 3..].strip_suffix(".cubin")
             && let Ok(arch) = rest.parse::<u32>()
         {
@@ -562,21 +573,20 @@ fn unpack_engine(zip_bytes: &[u8]) -> Result<(Manifest, Vec<Cubin>)> {
             cubins.push((arch, buf));
         }
     }
-    let manifest = manifest.ok_or_else(|| anyhow!("engine.zip has no manifest.json"))?;
     if cubins.is_empty() {
         bail!("engine.zip contains no *.sm<NN>.cubin files");
     }
     cubins.sort_by_key(|c| std::cmp::Reverse(c.0));
-    Ok((manifest, cubins))
+    Ok(cubins)
 }
 
 // --------------------------------------------------------------------------- run
 /// A fragment that's been claimed and has its blobs downloaded — ready for the GPU.
 struct ReadyJob {
     frag_id: String,
-    /// The slice of the job's space this fragment covers.
-    work: cuda::Work,
-    manifest: Manifest,
+    /// The slice of the job's space this fragment covers, still in the platform's
+    /// wording — it becomes a [`cuda::Work`] once the cubin reports its box.
+    claim: Claim,
     /// Arch-tagged cubins, highest arch first (see [`Cubin`]).
     cubins: Vec<Cubin>,
     data: Vec<u8>,
@@ -825,7 +835,7 @@ fn claim_and_fetch(
         return Ok(None);
     };
     let pull: Pull = serde_json::from_value(data.clone()).context("parsing pullOne response")?;
-    let work = pull.work()?;
+    let claim = pull.claim()?;
     let frag_id = pull.fragment.id.clone();
 
     // The platform round-robins fragments; with few open fragments it can re-hand us one
@@ -859,15 +869,14 @@ fn claim_and_fetch(
         }
         let download_secs = dl_start.elapsed().as_secs_f64();
         let engine_zip = engine_zip.ok_or_else(|| anyhow!("job has no engine .zip blob"))?;
-        let (manifest, cubins) = unpack_engine(&engine_zip)?;
+        let cubins = unpack_engine(&engine_zip)?;
         let data = match data_blob {
             Some((name, blob)) => decompress_data(&name, &blob)?,
             None => Vec::new(),
         };
         Ok(ReadyJob {
             frag_id: frag_id.clone(),
-            work: work.clone(),
-            manifest,
+            claim,
             cubins,
             data,
             download_secs,
@@ -876,7 +885,7 @@ fn claim_and_fetch(
 
     match fetched {
         Ok(job) => {
-            eprintln!("[decryptd] GPU#{ordinal} claimed {work}");
+            eprintln!("[decryptd] GPU#{ordinal} claimed {}", job.claim);
             Ok(Some(job))
         }
         Err(e) => {
@@ -969,25 +978,30 @@ fn decode_stream(dec: &mut dyn compcol::Decoder, input: &[u8]) -> Result<Vec<u8>
 const JOB_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJob> {
-    job.manifest.check_format()?;
     let gpu = cuda::Gpu::load_first(ordinal, &job.cubins).map_err(|e| anyhow!(e))?;
     let (maj, min) = gpu.compute_capability();
     let cubin_arch = gpu.cubin_arch();
     let gpu_name = gpu.device_name();
-    let label = job.work.to_string();
+
+    // Ask the cubin what it is and what space it walks — the only description of the
+    // job there is (api.md §5), and the one the device odometer is actually built on.
+    let desc = gpu.abi_desc().map_err(|e| anyhow!(e))?;
+    desc.check_version().map_err(|e| anyhow!(e))?;
+    let work = job.claim.resolve(desc.work_box)?;
+    let label = work.to_string();
     eprintln!(
-        "[decryptd] running {label} on GPU#{ordinal} {gpu_name} (sm_{maj}{min}, cubin sm{cubin_arch}): entry={}",
-        job.manifest.entry,
+        "[decryptd] running {label} on GPU#{ordinal} {gpu_name} (sm_{maj}{min}, cubin sm{cubin_arch}): {} axes",
+        work.bounds.nfields(),
     );
     let t0 = Instant::now();
     let output = cuda::run_job(
         &gpu,
-        &job.manifest.entry,
+        ENTRY,
         &job.data,
-        &job.work,
-        job.manifest.out_cap,
-        job.manifest.block,
-        job.manifest.tile,
+        &work,
+        OUT_CAP,
+        BLOCK,
+        TILE,
         JOB_TIMEOUT,
         {
             // Feed the tray's rate meter per tile: record the item delta since the
@@ -1006,7 +1020,8 @@ fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJo
     )
     .map_err(|e| anyhow!("run_job: {e}"))?;
     let run_secs = t0.elapsed().as_secs_f64();
-    let records = job.manifest.count_records(&output);
+    // For logs and submit telemetry only — decryptd never interprets a record.
+    let records = cuda::count_framed_records(&output);
     eprintln!("[decryptd] GPU#{ordinal} ran {label}: {records} record(s) in {run_secs:.1}s");
     Ok(FinishedJob {
         frag_id: job.frag_id,
@@ -1468,41 +1483,6 @@ fn run_worker(args: RunArgs, status: Status) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// A v5 manifest carries **no** `record_size` — the stream is self-delimiting
-    /// (api.md §5). Parsing must accept that; when `record_size` was a required field,
-    /// a manifest without it failed to parse and took every fragment of the job with it.
-    #[test]
-    fn v5_manifest_parses_without_record_size() {
-        let m: Manifest =
-            serde_json::from_str(r#"{"entry":"decrypt","out_cap":1048576,"format":5}"#)
-                .expect("a v5 manifest carries no record_size");
-        m.check_format().expect("v5 is the format this worker runs");
-        assert_eq!(m.out_cap, 1048576, "out_cap is a byte count");
-        assert_eq!(m.entry, "decrypt");
-        // Records are counted by walking the framing, not by dividing by a size.
-        let stream = [9u8, 1, 0, 0, 0, 0, 0, 0, 0, 9, 2, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(m.count_records(&stream), 2);
-        // Launch params still default when the manifest leaves them out.
-        assert_eq!((m.block, m.tile), (d_block(), d_tile()));
-    }
-
-    /// Every pre-v5 format addressed work by a flat index and seeded a differently
-    /// shaped work cell, so running one as v5 would compute the wrong cells silently
-    /// rather than fail. Refuse them all — including v4, which was superseded before a
-    /// single job was dispatched (api.md §6) — and anything newer than v5 too.
-    #[test]
-    fn non_v5_formats_are_refused() {
-        for format in [0u32, 1, 2, 3, 4, 6, 99] {
-            let m: Manifest =
-                serde_json::from_str(&format!(r#"{{"out_cap":4096,"format":{format}}}"#))
-                    .expect("manifest parses");
-            assert!(m.check_format().is_err(), "format {format} must be refused");
-        }
-        // A manifest with no `format` at all is a pre-v3 one, and equally refused.
-        let m: Manifest = serde_json::from_str(r#"{"record_size":29,"out_cap":4096}"#).unwrap();
-        assert!(m.check_format().is_err(), "an absent format is pre-v3");
-    }
-
     fn pull_of(fragment: &str, job: &str) -> Pull {
         serde_json::from_str(&format!(
             r#"{{"Fragment":{fragment},"Job":{job},"Response_Key":"k"}}"#
@@ -1510,54 +1490,119 @@ mod tests {
         .expect("pullOne response parses")
     }
 
-    /// A bounded job's fragment is a contiguous odometer run: `Start` + `Steps` against
-    /// the job's `Bounds`.
+    /// A fragment claims `Start` + `Steps`; the box those are positions in comes from
+    /// the cubin, so resolving the claim is what turns it into a runnable cursor.
     #[test]
-    fn bounded_pull_becomes_an_odometer_run() {
+    fn a_claim_resolves_against_the_cubins_box() {
         let pull = pull_of(
             r#"{"Decrypt_Job_Fragment__":"f","Start":"4/1/0","Steps":"65536"}"#,
             r#"{"Bounds":"4-8/1-255/0-65536","Data":[]}"#,
         );
-        let work = pull.work().expect("bounded work");
-        // Reversed into kernel order: the rightmost wire field is axis 0.
-        assert_eq!(work.pos, vec![0, 1, 4]);
+        let claim = pull.claim().expect("a v5 claim");
+        assert_eq!(claim.to_string(), "4/1/0 +65536");
+
+        // The box as the cubin reports it: axis 0 first, the reverse of the wire order.
+        let boxed = cuda::WorkBox::new(vec![(0, 65536), (1, 255), (4, 8)]).unwrap();
+        let work = claim.resolve(boxed).expect("claim resolves");
+        assert_eq!(work.pos, vec![0, 1, 4], "start reversed into kernel order");
         assert_eq!(work.steps, 65536);
         assert_eq!(work.bounds.nfields(), 3);
         // Logs read back in the platform's own spelling.
         assert_eq!(work.to_string(), "4/1/0 +65536");
     }
 
+    /// The platform's `Bounds` is compared against the cubin's box but never blocks the
+    /// run: the cubin is what the device actually walks, so a stale job row is a
+    /// bookkeeping problem, not a reason to idle a GPU. It warns and runs the cubin's.
+    #[test]
+    fn platform_bounds_disagreeing_only_warns() {
+        let pull = pull_of(
+            r#"{"Decrypt_Job_Fragment__":"f","Start":"0/0","Steps":"16"}"#,
+            r#"{"Bounds":"0-9/0-9","Data":[]}"#,
+        );
+        let claim = pull.claim().unwrap();
+        // Agreement: nothing to say.
+        let same = cuda::WorkBox::new(vec![(0, 9), (0, 9)]).unwrap();
+        assert_eq!(claim.resolve(same).unwrap().bounds.nfields(), 2);
+
+        // Same arity, different bounds — the case the core cannot catch. The cubin's box
+        // is what runs, so the cursor is interpreted in *its* radices.
+        let wider = cuda::WorkBox::new(vec![(0, 9), (0, 99)]).unwrap();
+        let work = claim.resolve(wider.clone()).expect("warns, does not fail");
+        assert_eq!(work.bounds, wider, "the cubin's box is what runs");
+
+        // Unreadable bounds are equally survivable.
+        let junk = pull_of(
+            r#"{"Decrypt_Job_Fragment__":"f","Start":"0/0","Steps":"16"}"#,
+            r#"{"Bounds":"not-a-box","Data":[]}"#,
+        );
+        assert!(junk.claim().unwrap().resolve(wider).is_ok());
+    }
+
+    /// A `Start` that doesn't fit the cubin's box *is* fatal — unlike a stale `Bounds`,
+    /// there is no way to interpret the cursor, so there is nothing to run.
+    #[test]
+    fn a_start_outside_the_cubins_box_is_refused() {
+        let pull = pull_of(
+            r#"{"Decrypt_Job_Fragment__":"f","Start":"0/0","Steps":"16"}"#,
+            r#"{"Data":[]}"#,
+        );
+        let claim = pull.claim().unwrap();
+        // Three axes, but the fragment names two.
+        let deeper = cuda::WorkBox::new(vec![(0, 9), (0, 9), (0, 9)]).unwrap();
+        assert!(claim.resolve(deeper).is_err(), "axis count disagrees");
+
+        // Right arity, but the position sits outside an axis.
+        let shifted = pull_of(
+            r#"{"Decrypt_Job_Fragment__":"f","Start":"50/0","Steps":"1"}"#,
+            r#"{"Data":[]}"#,
+        );
+        let boxed = cuda::WorkBox::new(vec![(0, 9), (0, 9)]).unwrap();
+        assert!(shifted.claim().unwrap().resolve(boxed).is_err());
+    }
+
+    /// A job with no `Bounds` at all still runs — the cubin describes the space, and the
+    /// platform's copy is only ever a cross-check.
+    #[test]
+    fn a_claim_without_platform_bounds_still_resolves() {
+        let pull = pull_of(
+            r#"{"Decrypt_Job_Fragment__":"f","Start":"7","Steps":"4"}"#,
+            r#"{"Data":[]}"#,
+        );
+        let work = pull
+            .claim()
+            .unwrap()
+            .resolve(cuda::WorkBox::new(vec![(0, 9)]).unwrap())
+            .expect("no bounds to disagree with");
+        assert_eq!(work.pos, vec![7]);
+    }
+
     /// The platform still hands out pre-v5 jobs in the old `Range_Start`/`Range_End`
-    /// shape. This worker doesn't run them, so it must say so plainly — not misread the
-    /// fragment as a bounded run over a space it never described.
+    /// shape. This worker doesn't run them, so it must say so plainly rather than
+    /// misread the fragment as a run over a space it never described.
     #[test]
     fn pre_v5_pull_shapes_are_refused() {
-        // A legacy flat span: no Bounds, no Start.
+        // A legacy flat span: no Start at all.
         let legacy = pull_of(
             r#"{"Decrypt_Job_Fragment__":"f","Range_Start":"1000","Range_End":"5096"}"#,
             r#"{"Data":[]}"#,
         );
-        assert!(legacy.work().is_err(), "a flat range is not v5 work");
-        // Bounds but no Start, or a Start with no Bounds: half a shape either way.
+        assert!(legacy.claim().is_err(), "a flat range is not v5 work");
+        // Bounds present but still no Start.
         let a = pull_of(
             r#"{"Decrypt_Job_Fragment__":"f","Range_Start":"0","Range_End":"9"}"#,
             r#"{"Bounds":"0-9","Data":[]}"#,
         );
-        assert!(a.work().is_err(), "bounds without a Start");
-        let b = pull_of(
-            r#"{"Decrypt_Job_Fragment__":"f","Start":"3","Steps":"4"}"#,
-            r#"{"Data":[]}"#,
-        );
-        assert!(b.work().is_err(), "Start without bounds");
-        // Neither shape at all.
-        let c = pull_of(r#"{"Decrypt_Job_Fragment__":"f"}"#, r#"{"Data":[]}"#);
-        assert!(c.work().is_err(), "no work described");
-        // Bounded but with a zero-length run.
-        let d = pull_of(
+        assert!(a.claim().is_err(), "bounds without a Start");
+        // Nothing described at all.
+        let b = pull_of(r#"{"Decrypt_Job_Fragment__":"f"}"#, r#"{"Data":[]}"#);
+        assert!(b.claim().is_err(), "no work described");
+        // A zero-length run.
+        let c = pull_of(
             r#"{"Decrypt_Job_Fragment__":"f","Start":"3","Steps":"0"}"#,
             r#"{"Bounds":"0-9","Data":[]}"#,
         );
-        assert!(d.work().is_err(), "zero steps");
+        assert!(c.claim().is_err(), "zero steps");
     }
 
     // The exact inline blob the platform handed back in the field, which rsurl
