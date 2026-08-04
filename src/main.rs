@@ -8,14 +8,15 @@
 
 //! `decryptd` — a GPU job runner for decrypt.
 //!
-//! decryptd knows nothing about bloom filters, RNG, or BIP39. It just:
+//! decryptd knows nothing about what any job computes. It just:
 //!   1. claims a fragment of work from the platform (`Decrypt/Job:pullOne`),
 //!   2. downloads the job's blobs (`engine.zip` + an optional compressed `data`
 //!      blob — xz or gzip, auto-detected) from the inline URLs the pull
 //!      response carries,
 //!   3. reads launch parameters from `manifest.json` inside `engine.zip`, loads the
-//!      cubin for the local GPU, and launches its kernel over the fragment range
-//!      (the kernel does all the real work and writes output records),
+//!      cubin for the local GPU, and launches its kernel over the fragment's slice of
+//!      the job's work space (the kernel does all the real work and writes output
+//!      records),
 //!   4. gathers the output records, compresses them (gzip), and submits them back with
 //!      `Decrypt/Job:submit`.
 //!
@@ -132,35 +133,32 @@ struct Pull {
     #[serde(rename = "Response_Key")]
     response_key: String,
 }
-/// One claimed slice of work. The platform hands out two shapes (`Decrypt/Job:pullOne`):
-/// **bounded** jobs — the v5 ABI's box — carve their range as an odometer run and send
-/// `Start`/`Steps`, while **legacy** jobs keep the original half-open integer span in
-/// `Range_Start`/`Range_End`. Exactly one pair is populated.
+/// One claimed slice of work, as `Decrypt/Job:pullOne` describes a **bounded** job: a
+/// contiguous run of the job's odometer.
+///
+/// The platform still hands out pre-v5 jobs in its older shape (`Range_Start`/
+/// `Range_End`, a flat integer span). This worker no longer runs those, so those fields
+/// are deliberately not deserialized — a legacy fragment is detected by its missing
+/// `Start` and reported, not misread.
 #[derive(Deserialize)]
 struct Fragment {
     /// Fragment UUID — used to detect a fragment the platform re-issued to us while
     /// we're still processing it (so we don't run the same work twice).
     #[serde(rename = "Decrypt_Job_Fragment__")]
     id: String,
-    /// **Bounded** — the odometer position this run starts at: one bare value per axis,
-    /// `"v/v/…"`, leftmost most significant (same spelling as `Job.Bounds`).
+    /// The odometer position this run starts at: one bare value per axis, `"v/v/…"`,
+    /// leftmost most significant (same spelling as `Job.Bounds`).
     #[serde(rename = "Start", default)]
     start: Option<String>,
-    /// **Bounded** — cells to walk from `start`.
+    /// Cells to walk from `start`.
     #[serde(rename = "Steps", default, deserialize_with = "de_opt_u64")]
     steps: Option<u64>,
-    /// **Legacy** — inclusive low end of the flat index span.
-    #[serde(rename = "Range_Start", default, deserialize_with = "de_opt_u128")]
-    range_start: Option<u128>,
-    /// **Legacy** — exclusive high end; the platform's spans are `[Start, End)`.
-    #[serde(rename = "Range_End", default, deserialize_with = "de_opt_u128")]
-    range_end: Option<u128>,
 }
 #[derive(Deserialize)]
 struct Job {
-    /// **Bounded jobs only** — the work space, `"lo-hi/lo-hi/…"` leftmost most
-    /// significant. One field per axis the tiler walks; the job blob carries the same
-    /// axes for the kernel, so decryptd never has to open it.
+    /// The work space, `"lo-hi/lo-hi/…"` leftmost most significant — one field per box
+    /// axis. The job blob carries the same axes for the kernel, so decryptd never has
+    /// to open it.
     #[serde(rename = "Bounds", default)]
     bounds: Option<String>,
     #[serde(rename = "Data", default)]
@@ -168,36 +166,21 @@ struct Job {
 }
 
 impl Pull {
-    /// The work this fragment covers, in whichever shape its job uses.
+    /// The work this fragment covers.
     fn work(&self) -> Result<cuda::Work> {
-        let f = &self.fragment;
-        match (&self.job.bounds, &f.start) {
-            (Some(bounds), Some(start)) => {
-                let bounds = cuda::WorkBox::parse_bounds(bounds).map_err(|e| anyhow!(e))?;
-                let pos = bounds.parse_position(start).map_err(|e| anyhow!(e))?;
-                let steps = f.steps.unwrap_or(0);
-                if steps == 0 {
-                    bail!("bounded fragment {start} has no steps");
-                }
-                Ok(cuda::Work::Odometer { bounds, pos, steps })
-            }
-            // A job that carries only one half of the bounded shape is malformed; do not
-            // fall back to the legacy fields, which would silently run the wrong space.
-            (Some(_), None) => bail!("bounded job gave no fragment Start"),
-            (None, Some(_)) => bail!("fragment has a Start but its job has no Bounds"),
-            (None, None) => {
-                let (Some(start), Some(end)) = (f.range_start, f.range_end) else {
-                    bail!("fragment has neither a bounded run nor a legacy range");
-                };
-                if end <= start {
-                    bail!("empty fragment range [{start}, {end})");
-                }
-                Ok(cuda::Work::Flat {
-                    start,
-                    end_incl: end - 1,
-                })
-            }
+        let (Some(bounds), Some(start)) = (&self.job.bounds, &self.fragment.start) else {
+            bail!(
+                "fragment is not a bounded (v5) run — this worker only runs v5 jobs \
+                 (api.md §1)"
+            );
+        };
+        let bounds = cuda::WorkBox::parse_bounds(bounds).map_err(|e| anyhow!(e))?;
+        let pos = bounds.parse_position(start).map_err(|e| anyhow!(e))?;
+        let steps = self.fragment.steps.unwrap_or(0);
+        if steps == 0 {
+            bail!("bounded fragment {start} has no steps");
         }
+        Ok(cuda::Work { bounds, pos, steps })
     }
 }
 #[derive(Deserialize)]
@@ -213,25 +196,9 @@ struct DataRef {
     hash: String,
 }
 
-/// A legacy fragment range: a decimal string on the platform (the column is a VARCHAR,
-/// not a BIGINT), though a JSON number is accepted too. `None` when the field is absent
-/// or null, which is how a bounded job's fragment arrives. `u128` rather than `u64`
-/// because the column is arbitrary-precision; the ABI's own 64-bit limit is enforced
-/// where the range is used, with a message that says so.
-fn de_opt_u128<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u128>, D::Error> {
-    use serde::de::Error;
-    match Value::deserialize(d)? {
-        Value::Null => Ok(None),
-        Value::String(s) => s.parse().map(Some).map_err(Error::custom),
-        Value::Number(n) => n
-            .as_u128()
-            .map(Some)
-            .ok_or_else(|| Error::custom("not a non-negative integer")),
-        other => Err(Error::custom(format!("expected an integer, got {other}"))),
-    }
-}
-
-/// `Fragment.Steps` — cells in a bounded run. Same string-or-number tolerance.
+/// `Fragment.Steps` — cells in a bounded run. The platform's numeric columns are
+/// VARCHARs, so this arrives as a decimal string; a JSON number is accepted too. `None`
+/// when the field is absent or null, which is how a pre-v5 fragment arrives.
 fn de_opt_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
     use serde::de::Error;
     match Value::deserialize(d)? {
@@ -257,58 +224,43 @@ struct Manifest {
     /// Kernel entry-point symbol name.
     #[serde(default = "d_entry")]
     entry: String,
-    /// Output record size in bytes (e.g. 28 = u64 seed + 20-byte address).
-    /// **Pre-v3 only** — a v3+ stream is self-delimiting, so those manifests omit it.
-    #[serde(default)]
-    record_size: u32,
-    /// Output buffer capacity — in *bytes* under v3/v5, in *records* pre-v3.
+    /// Output buffer capacity in bytes. There is no `record_size` — a v5 stream is
+    /// self-delimiting and decryptd is byte-oriented (api.md §5).
     #[serde(default = "d_out_cap")]
     out_cap: u32,
     /// CUDA block size.
     #[serde(default = "d_block")]
     block: u32,
-    /// Work-items per kernel launch. Under v5 these are cells of the job's box
-    /// (api.md §1.3), the same unit a fragment's `Steps` counts in.
+    /// Box cells per kernel launch — the same unit a fragment's `Steps` counts in.
     #[serde(default = "d_tile")]
     tile: u64,
-    /// Box axes the tiler enumerates (`nthread`, api.md §1.3) — **v5 only**, and a
-    /// property of the cubin, not of the job. It is redundant with the job's own
-    /// `Bounds`, which is what the work cell declares, so it is only cross-checked
-    /// against them; `0` (absent) skips that check.
-    #[serde(default)]
-    thread_fields: u32,
-    /// Output format version: `5` selects the v5 kernel ABI, `3` the v3 one; absent or
-    /// `< 3` selects the legacy fixed-record ABI (api.md §5/§6).
+    /// Output format version. Only `5` runs here: this worker dropped the pre-v5 ABIs,
+    /// and v4 was never dispatched at all (api.md §5/§6).
     #[serde(default)]
     format: u32,
 }
 
+/// The only kernel ABI this worker speaks (api.md §1).
+const ABI_FORMAT: u32 = 5;
+
 impl Manifest {
-    /// Which kernel ABI this job's cubins implement.
-    fn abi(&self) -> Result<cuda::Abi> {
-        match self.format {
-            0..=2 => Ok(cuda::Abi::Legacy {
-                record_size: self.record_size,
-            }),
-            3 => Ok(cuda::Abi::V3),
-            // v4 was specified and then superseded before a single job was dispatched
-            // (api.md §6), so there is nothing to stay compatible with — and its work
-            // cell would be misread as v5's. Refuse it rather than guess.
-            4 => bail!("manifest format 4 was never dispatched and is not supported"),
-            5 => Ok(cuda::Abi::V5 {
-                thread_fields: self.thread_fields,
-            }),
-            other => bail!("manifest format {other} is newer than this worker supports"),
+    /// Reject a job whose cubins don't implement the ABI this worker runs. Every older
+    /// format addressed work by a flat index and seeded a differently shaped work cell,
+    /// so running one as v5 would compute the wrong cells silently rather than fail.
+    fn check_format(&self) -> Result<()> {
+        if self.format != ABI_FORMAT {
+            bail!(
+                "manifest format {} is not the v{ABI_FORMAT} ABI this worker runs",
+                self.format
+            );
         }
+        Ok(())
     }
 
     /// Number of output records in a finished fragment's buffer — for logs and submit
     /// telemetry only; decryptd never interprets a record's contents.
-    fn count_records(&self, abi: cuda::Abi, output: &[u8]) -> usize {
-        match abi {
-            cuda::Abi::V3 | cuda::Abi::V5 { .. } => cuda::count_framed_records(output),
-            cuda::Abi::Legacy { record_size } => output.len() / record_size.max(1) as usize,
-        }
+    fn count_records(&self, output: &[u8]) -> usize {
+        cuda::count_framed_records(output)
     }
 }
 fn d_entry() -> String {
@@ -1017,14 +969,14 @@ fn decode_stream(dec: &mut dyn compcol::Decoder, input: &[u8]) -> Result<Vec<u8>
 const JOB_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJob> {
-    let abi = job.manifest.abi()?;
+    job.manifest.check_format()?;
     let gpu = cuda::Gpu::load_first(ordinal, &job.cubins).map_err(|e| anyhow!(e))?;
     let (maj, min) = gpu.compute_capability();
     let cubin_arch = gpu.cubin_arch();
     let gpu_name = gpu.device_name();
     let label = job.work.to_string();
     eprintln!(
-        "[decryptd] running {label} on GPU#{ordinal} {gpu_name} (sm_{maj}{min}, cubin sm{cubin_arch}): entry={} abi={abi:?}",
+        "[decryptd] running {label} on GPU#{ordinal} {gpu_name} (sm_{maj}{min}, cubin sm{cubin_arch}): entry={}",
         job.manifest.entry,
     );
     let t0 = Instant::now();
@@ -1033,7 +985,6 @@ fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJo
         &job.manifest.entry,
         &job.data,
         &job.work,
-        abi,
         job.manifest.out_cap,
         job.manifest.block,
         job.manifest.tile,
@@ -1055,7 +1006,7 @@ fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJo
     )
     .map_err(|e| anyhow!("run_job: {e}"))?;
     let run_secs = t0.elapsed().as_secs_f64();
-    let records = job.manifest.count_records(abi, &output);
+    let records = job.manifest.count_records(&output);
     eprintln!("[decryptd] GPU#{ordinal} ran {label}: {records} record(s) in {run_secs:.1}s");
     Ok(FinishedJob {
         frag_id: job.frag_id,
@@ -1517,77 +1468,39 @@ fn run_worker(args: RunArgs, status: Status) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// A v3 manifest carries `format: 3` and **no** `record_size` (the stream is
-    /// self-delimiting). Parsing must accept that and select the v3 ABI — before v3
-    /// support, `record_size` was a required field and such a manifest failed to
-    /// parse, failing every fragment of the job.
+    /// A v5 manifest carries **no** `record_size` — the stream is self-delimiting
+    /// (api.md §5). Parsing must accept that; when `record_size` was a required field,
+    /// a manifest without it failed to parse and took every fragment of the job with it.
     #[test]
-    fn v3_manifest_parses_without_record_size() {
+    fn v5_manifest_parses_without_record_size() {
         let m: Manifest =
-            serde_json::from_str(r#"{"entry":"decrypt","out_cap":1048576,"format":3}"#)
-                .expect("v3 manifest must parse without record_size");
-        let abi = m.abi().expect("v3 is a supported format");
-        assert!(matches!(abi, cuda::Abi::V3));
-        assert_eq!(m.out_cap, 1048576, "v3 out_cap is a byte count");
+            serde_json::from_str(r#"{"entry":"decrypt","out_cap":1048576,"format":5}"#)
+                .expect("a v5 manifest carries no record_size");
+        m.check_format().expect("v5 is the format this worker runs");
+        assert_eq!(m.out_cap, 1048576, "out_cap is a byte count");
         assert_eq!(m.entry, "decrypt");
-        // v3 records are counted by walking the framing, not by dividing by a size.
+        // Records are counted by walking the framing, not by dividing by a size.
         let stream = [9u8, 1, 0, 0, 0, 0, 0, 0, 0, 9, 2, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(m.count_records(abi, &stream), 2);
+        assert_eq!(m.count_records(&stream), 2);
+        // Launch params still default when the manifest leaves them out.
+        assert_eq!((m.block, m.tile), (d_block(), d_tile()));
     }
 
-    /// Pre-v3 manifests (no `format`, or an older one) must still select the legacy
-    /// fixed-record ABI — jobs dispatched before v3 keep draining (api.md §6).
+    /// Every pre-v5 format addressed work by a flat index and seeded a differently
+    /// shaped work cell, so running one as v5 would compute the wrong cells silently
+    /// rather than fail. Refuse them all — including v4, which was superseded before a
+    /// single job was dispatched (api.md §6) — and anything newer than v5 too.
     #[test]
-    fn pre_v3_manifest_selects_the_legacy_abi() {
-        for src in [
-            r#"{"record_size":29,"out_cap":4096}"#,
-            r#"{"record_size":29,"out_cap":4096,"format":2}"#,
-        ] {
-            let m: Manifest = serde_json::from_str(src).expect("legacy manifest");
-            let abi = m.abi().expect("legacy is a supported format");
-            assert!(
-                matches!(abi, cuda::Abi::Legacy { record_size: 29 }),
-                "{src}"
-            );
-            assert_eq!(m.entry, "decrypt", "entry still defaults");
-            assert_eq!(m.count_records(abi, &[0u8; 29 * 3]), 3, "{src}");
-        }
-    }
-
-    /// A v5 manifest adds `thread_fields` — how many leading box axes the tiler
-    /// enumerates. Absent means every axis in the blob is a thread dimension, which is
-    /// what a core with no amortising inner loop bakes.
-    #[test]
-    fn v5_manifest_selects_the_thread_dimensions() {
-        let m: Manifest = serde_json::from_str(r#"{"out_cap":1048576,"format":5}"#)
-            .expect("v5 manifest must parse without thread_fields");
-        let abi = m.abi().expect("v5 is supported");
-        assert!(matches!(abi, cuda::Abi::V5 { thread_fields: 0 }));
-        // Still a framed byte stream, so records are counted by walking the framing.
-        let stream = [9u8, 1, 0, 0, 0, 0, 0, 0, 0, 9, 2, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(m.count_records(abi, &stream), 2);
-
-        let m: Manifest =
-            serde_json::from_str(r#"{"out_cap":1048576,"format":5,"thread_fields":3}"#)
-                .expect("v5 manifest with loop dimensions");
-        assert!(matches!(
-            m.abi().expect("v5 is supported"),
-            cuda::Abi::V5 { thread_fields: 3 }
-        ));
-    }
-
-    /// v4 was specified and superseded before a single job was dispatched (api.md §6),
-    /// so nothing can legitimately carry it. Its work cell starts with the base index
-    /// where v5's starts with the step count, so running one as the other would compute
-    /// the wrong cells silently — refuse it, and refuse anything newer than v5 too.
-    #[test]
-    fn unsupported_formats_are_refused() {
-        for format in [4u32, 6, 99] {
+    fn non_v5_formats_are_refused() {
+        for format in [0u32, 1, 2, 3, 4, 6, 99] {
             let m: Manifest =
                 serde_json::from_str(&format!(r#"{{"out_cap":4096,"format":{format}}}"#))
                     .expect("manifest parses");
-            assert!(m.abi().is_err(), "format {format} must be refused");
+            assert!(m.check_format().is_err(), "format {format} must be refused");
         }
+        // A manifest with no `format` at all is a pre-v3 one, and equally refused.
+        let m: Manifest = serde_json::from_str(r#"{"record_size":29,"out_cap":4096}"#).unwrap();
+        assert!(m.check_format().is_err(), "an absent format is pre-v3");
     }
 
     fn pull_of(fragment: &str, job: &str) -> Pull {
@@ -1597,8 +1510,8 @@ mod tests {
         .expect("pullOne response parses")
     }
 
-    /// A **bounded** job's fragment is a contiguous odometer run: `Start` + `Steps`
-    /// against the job's `Bounds`, with no `Range_End` at all.
+    /// A bounded job's fragment is a contiguous odometer run: `Start` + `Steps` against
+    /// the job's `Bounds`.
     #[test]
     fn bounded_pull_becomes_an_odometer_run() {
         let pull = pull_of(
@@ -1606,64 +1519,39 @@ mod tests {
             r#"{"Bounds":"4-8/1-255/0-65536","Data":[]}"#,
         );
         let work = pull.work().expect("bounded work");
-        let cuda::Work::Odometer { pos, steps, .. } = &work else {
-            panic!("expected an odometer run, got {work:?}");
-        };
         // Reversed into kernel order: the rightmost wire field is axis 0.
-        assert_eq!(*pos, vec![0, 1, 4]);
-        assert_eq!(*steps, 65536);
+        assert_eq!(work.pos, vec![0, 1, 4]);
+        assert_eq!(work.steps, 65536);
+        assert_eq!(work.bounds.nfields(), 3);
         // Logs read back in the platform's own spelling.
         assert_eq!(work.to_string(), "4/1/0 +65536");
     }
 
-    /// **Legacy and v3** jobs keep the original half-open `Range_Start`/`Range_End`
-    /// span, which must still parse and still drive a flat run — those jobs are live.
+    /// The platform still hands out pre-v5 jobs in the old `Range_Start`/`Range_End`
+    /// shape. This worker doesn't run them, so it must say so plainly — not misread the
+    /// fragment as a bounded run over a space it never described.
     #[test]
-    fn legacy_pull_stays_a_flat_range() {
-        let pull = pull_of(
+    fn pre_v5_pull_shapes_are_refused() {
+        // A legacy flat span: no Bounds, no Start.
+        let legacy = pull_of(
             r#"{"Decrypt_Job_Fragment__":"f","Range_Start":"1000","Range_End":"5096"}"#,
             r#"{"Data":[]}"#,
         );
-        let work = pull.work().expect("legacy work");
-        assert!(
-            matches!(
-                work,
-                cuda::Work::Flat {
-                    start: 1000,
-                    end_incl: 5095
-                }
-            ),
-            "got {work:?}"
-        );
-        assert_eq!(work.to_string(), "[1000, 5096)");
-
-        // An empty span is a platform bug, not something to launch a kernel over.
-        let empty = pull_of(
-            r#"{"Decrypt_Job_Fragment__":"f","Range_Start":"7","Range_End":"7"}"#,
-            r#"{"Data":[]}"#,
-        );
-        assert!(empty.work().is_err());
-    }
-
-    /// Half a bounded shape must not silently fall through to the legacy fields — that
-    /// would run a completely different space. Same for a fragment carrying neither.
-    #[test]
-    fn mixed_or_missing_pull_shapes_are_refused() {
-        // Bounds but no Start.
+        assert!(legacy.work().is_err(), "a flat range is not v5 work");
+        // Bounds but no Start, or a Start with no Bounds: half a shape either way.
         let a = pull_of(
             r#"{"Decrypt_Job_Fragment__":"f","Range_Start":"0","Range_End":"9"}"#,
             r#"{"Bounds":"0-9","Data":[]}"#,
         );
         assert!(a.work().is_err(), "bounds without a Start");
-        // Start but no Bounds.
         let b = pull_of(
             r#"{"Decrypt_Job_Fragment__":"f","Start":"3","Steps":"4"}"#,
             r#"{"Data":[]}"#,
         );
         assert!(b.work().is_err(), "Start without bounds");
-        // Neither shape.
+        // Neither shape at all.
         let c = pull_of(r#"{"Decrypt_Job_Fragment__":"f"}"#, r#"{"Data":[]}"#);
-        assert!(c.work().is_err(), "no range at all");
+        assert!(c.work().is_err(), "no work described");
         // Bounded but with a zero-length run.
         let d = pull_of(
             r#"{"Decrypt_Job_Fragment__":"f","Start":"3","Steps":"0"}"#,
