@@ -148,7 +148,8 @@ struct Fragment {
     #[serde(rename = "Decrypt_Job_Fragment__")]
     id: String,
     /// The odometer position this run starts at: one bare value per axis, `"v/v/…"`,
-    /// **axis 0 first** (same spelling and order as `Job.Bounds`).
+    /// **most significant axis first** (same spelling as `Job.Bounds`; the platform
+    /// steps the rightmost field, so axis 0 is spelled last — see [`cuda::WorkBox`]).
     #[serde(rename = "Start", default)]
     start: Option<String>,
     /// Cells to walk from `start`.
@@ -157,10 +158,10 @@ struct Fragment {
 }
 #[derive(Deserialize)]
 struct Job {
-    /// The platform's copy of the work space, `"lo-hi/lo-hi/…"` **axis 0 first** — the
-    /// order the cubin's descriptor and api.md use throughout. The cubin is the
-    /// authority (api.md §5); this is compared against it so a job created over a
-    /// different space than its cubin was built for is surfaced, not silently walked.
+    /// The platform's copy of the work space, `"lo-hi/lo-hi/…"` **most significant axis
+    /// first** (the reverse of the descriptor's stored order — see [`cuda::WorkBox`]).
+    /// The cubin is the authority (api.md §5); this is compared against it so a job
+    /// created over a different space than its cubin was built for is surfaced.
     #[serde(rename = "Bounds", default)]
     bounds: Option<String>,
     #[serde(rename = "Data", default)]
@@ -171,7 +172,7 @@ struct Job {
 /// until the cubin is loaded, because the values are positions in a box only the cubin
 /// describes (api.md §5).
 struct Claim {
-    /// `Fragment.Start` — one bare value per axis, axis 0 first.
+    /// `Fragment.Start` — one bare value per axis, most significant axis first.
     start: String,
     /// `Fragment.Steps` — cells to walk from `start`.
     steps: u64,
@@ -1508,11 +1509,11 @@ mod tests {
         let claim = pull.claim().expect("a v5 claim");
         assert_eq!(claim.to_string(), "0/1/4 +65536");
 
-        // The box as the cubin reports it — axis 0 first, the same order the platform
-        // spells `Bounds` and `Start` in, so nothing is reversed anywhere.
-        let boxed = cuda::WorkBox::new(vec![(0, 65536), (1, 255), (4, 8)]).unwrap();
-        let work = claim.resolve(boxed).expect("claim resolves");
-        assert_eq!(work.pos, vec![0, 1, 4], "start taken as written");
+        // The box as the cubin reports it — axis 0 first, i.e. the reverse of the
+        // most-significant-first wire spelling, so `4-8` (spelled last) is axis 0.
+        let boxed = cuda::WorkBox::new(vec![(4, 8), (1, 255), (0, 65536)]).unwrap();
+        let work = claim.resolve(boxed).expect("claim resolves; bounds agree");
+        assert_eq!(work.pos, vec![4, 1, 0], "start reversed into axis order");
         assert_eq!(work.steps, 65536);
         assert_eq!(work.bounds.nfields(), 3);
         // Logs read back in the platform's own spelling.
