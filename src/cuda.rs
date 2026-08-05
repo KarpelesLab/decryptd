@@ -504,6 +504,31 @@ fn steps_done(count: u64, resume: u64) -> Result<u64, ()> {
     Ok(resume.min(count))
 }
 
+/// Choose the next launch's cell count from what the last one did, aiming to fill about
+/// 7/8 of `out_cap` so the output buffer rarely overflows.
+///
+/// Overflow is expensive and lossy, not just noisy: when the buffer fills mid-launch the
+/// kernel records the lowest cell it could not write (the resume watermark), and the run
+/// keeps the whole written prefix — which includes records for cells *past* the
+/// watermark that won the atomic race — then re-runs from the watermark. So every
+/// overflow both **re-computes** the cells from the watermark to the launch's end and
+/// **duplicates** the records already emitted for them (decryptd can't dedup — it never
+/// parses a payload). Sizing each launch to fit is what keeps that rare.
+///
+/// * A launch that **overflowed** (`steps < count`) proves `steps` cells fit within
+///   `out_cap` before it filled, so target 7/8 of that.
+/// * A launch that **fit** (`steps == count`) leaves headroom: grow toward 7/8 of
+///   `out_cap` by the observed byte density (`raw_bytes / count`). A sparse launch
+///   (`raw_bytes` near 0) yields a huge estimate, clamped up to a full `tile`.
+fn next_launch(count: u64, steps: u64, raw_bytes: u32, out_cap: u32, tile: u64) -> u64 {
+    if steps < count {
+        (steps.saturating_mul(7) / 8).max(1)
+    } else {
+        let est = (count as u128) * (out_cap as u128) * 7 / 8 / (raw_bytes.max(1) as u128);
+        (est as u64).clamp(1, tile)
+    }
+}
+
 /// Length of the valid prefix of a framed stream (api.md §3): walks
 /// `uleb128(len) ‖ payload` records and stops at the terminating zero-length record
 /// (the zero-filled tail), at a truncated varint, or at a record that would run past
@@ -819,10 +844,11 @@ pub fn run_job(
     // (a paused worker must not time out). Checked once per tile below.
     let started = Instant::now();
     let mut paused = Duration::ZERO;
-    // Cells per launch. Normally a full tile: a launch that fills the output buffer
-    // still counts, because the resume watermark says where to pick up, so there is
-    // nothing to calibrate. It only shrinks to break a launch that made no progress at
-    // all (see below), and is restored as soon as one succeeds.
+    // Cells per launch. It starts optimistic at a full tile and then adapts to the
+    // observed match density (see [`next_launch`]) to keep the output buffer filling
+    // to ~7/8 without overflowing — because an overflow re-computes and duplicates the
+    // cells past the resume watermark. A dense region settles to a small launch instead
+    // of overflowing a full tile every step.
     let mut launch = tile;
     while done < total {
         let park = Instant::now();
@@ -931,11 +957,12 @@ pub fn run_job(
         // the framing walk finds the true end of the written prefix.
         //
         // Everything before the watermark is complete, so we keep the whole prefix and
-        // restart there. Threads race, so a filled buffer can also hold records for
-        // steps at or past the watermark, and re-running from it emits those a second
-        // time. That's inherent to the ABI (api.md §4 prescribes exactly this loop) and
-        // decryptd can't dedup — it doesn't know the payload layout, so it can't tell
-        // which cell a record belongs to. The consumer tolerates a repeated record; a
+        // restart there. On the rare launch that still overflows (`steps < count`),
+        // threads race, so the buffer can also hold records for cells at or past the
+        // watermark, and re-running from it emits those a second time. That's inherent to
+        // the ABI (api.md §4 prescribes exactly this loop) and decryptd can't dedup — it
+        // doesn't know the payload layout. `next_launch` keeps overflow rare so this
+        // stays the exception; the consumer still tolerates a repeated record, since a
         // dropped one it could not.
         let written = (raw as usize).min(out_cap as usize);
         if written > 0 {
@@ -948,7 +975,8 @@ pub fn run_job(
             buf.truncate(framed_len(&buf));
             results.extend_from_slice(&buf);
         }
-        launch = tile; // undo any shrink from a no-progress retry
+        // Re-size the next launch from this one's fill so the buffer rarely overflows.
+        launch = next_launch(count, steps, raw, out_cap, tile);
         done += u128::from(steps);
         progress(done.min(total), total);
     }
@@ -1303,6 +1331,30 @@ mod tests {
         assert_eq!(steps_done(8, 99), Ok(8));
         // The cubin cannot run this job's box shape: refused outright.
         assert_eq!(steps_done(8, ABI_REJECT), Err(()));
+    }
+
+    /// The launch-sizing controller keeps the output buffer near 7/8 full so overflow —
+    /// which re-computes and duplicates the cells past the watermark — stays rare.
+    #[test]
+    fn next_launch_targets_seven_eighths_fill() {
+        let (cap, tile) = (1u32 << 20, 1u64 << 24);
+
+        // Overflowed (steps < count): `steps` cells fit, so aim for 7/8 of that. `raw`
+        // is irrelevant here — the watermark is the reliable signal.
+        assert_eq!(next_launch(1000, 800, u32::MAX, cap, tile), 700);
+        // A tiny watermark still yields a runnable launch, never 0.
+        assert_eq!(next_launch(10, 1, cap, cap, tile), 1);
+
+        // Fit with headroom (steps == count): grow by the observed density. A sparse
+        // launch (few bytes) jumps to a full tile.
+        assert_eq!(next_launch(1000, 1000, 8, cap, tile), tile);
+        assert_eq!(next_launch(1000, 1000, 0, cap, tile), tile); // no hits at all
+
+        // Fit but nearly full: shrink slightly to keep the 7/8 margin.
+        assert_eq!(next_launch(1000, 1000, cap, cap, tile), 875);
+
+        // Never proposes more than a tile.
+        assert!(next_launch(1, 1, 1, cap, tile) <= tile);
     }
 
     /// Verifies the overflow/resume path end to end: with an `out_cap` far smaller than
