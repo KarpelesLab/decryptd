@@ -318,32 +318,36 @@ impl WorkBox {
         Ok(WorkBox { axes })
     }
 
-    /// Parse a `Job.Bounds` spec: `"lo-hi/lo-hi/…"`, one field per axis, **most
-    /// significant field first** — so the axes are stored reversed.
+    /// Parse a box string (api.md §1.2): slash-separated fields, **fastest axis last**,
+    /// each field either a swept `lo-hi` or a pinned bare `n` (shorthand for `n-n`).
     ///
     /// The ABI is axis-0-first everywhere: index 0 is the fastest-cycling axis, in the
-    /// cubin's descriptor and in the cell (api.md §1.2). But the platform's odometer
-    /// (klbfw `Decrypt\Range`) advances the **rightmost** field of the string as work
-    /// progresses, so for the fastest axis to be the one it steps, the wire spelling
-    /// puts axis 0 *last*. The string is therefore the reverse of the internal order,
-    /// and reading it as-written would sweep the space transposed — one axis pinned
-    /// while another runs — rather than fail. (This reversal must match how the
-    /// publisher spells the string; see the `de88d98`/re-add history.)
+    /// cubin's descriptor and in the cell. But the platform's odometer (klbfw
+    /// `Decrypt\Range`) advances the **rightmost** field of the string as work
+    /// progresses, so for the fastest axis to be the one it steps, the string spells it
+    /// last — the reverse of the internal order. Reading it as-written would sweep the
+    /// space transposed (one axis pinned while another runs) rather than fail, so the
+    /// fields are reversed on the way in. Bounds are unsigned, so `-` is unambiguously
+    /// the range separator and a field with none is a pinned axis.
     pub fn parse_bounds(spec: &str) -> Result<WorkBox, String> {
         let mut axes = Vec::new();
         for (i, field) in spec.split('/').enumerate() {
             let f = field.trim();
-            let (lo, hi) = f
-                .split_once('-')
-                .ok_or_else(|| format!("bounds field {i} {f:?} is not `lo-hi`"))?;
-            let parse = |s: &str, what: &str| -> Result<u64, String> {
+            let num = |s: &str, what: &str| -> Result<u64, String> {
                 s.trim()
                     .parse::<u64>()
                     .map_err(|e| format!("bounds field {i} {what} {s:?}: {e}"))
             };
-            axes.push((parse(lo, "low")?, parse(hi, "high")?));
+            let axis = match f.split_once('-') {
+                Some((lo, hi)) => (num(lo, "low")?, num(hi, "high")?),
+                None => {
+                    let n = num(f, "value")?; // pinned axis: `n` == `n-n`
+                    (n, n)
+                }
+            };
+            axes.push(axis);
         }
-        axes.reverse(); // wire is most-significant-first; store axis 0 (fastest) first
+        axes.reverse(); // wire is fastest-last; store axis 0 (fastest) first
         WorkBox::new(axes)
     }
 
@@ -429,15 +433,22 @@ impl WorkBox {
 }
 
 impl std::fmt::Display for WorkBox {
-    /// Rendered the way a `Job.Bounds` is spelled — most significant axis first, the
-    /// reverse of the stored order — so a box read off a cubin can be compared with the
+    /// Rendered the way a `Job.Bounds` is spelled (api.md §1.2) — most significant axis
+    /// first, the reverse of the stored order, with a pinned axis (`lo == hi`) collapsed
+    /// to a bare `n` — so a box read off a cubin round-trips and diffs against the
     /// platform's copy by eye.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let wire: Vec<String> = self
             .axes
             .iter()
             .rev()
-            .map(|(lo, hi)| format!("{lo}-{hi}"))
+            .map(|(lo, hi)| {
+                if lo == hi {
+                    lo.to_string()
+                } else {
+                    format!("{lo}-{hi}")
+                }
+            })
             .collect();
         f.write_str(&wire.join("/"))
     }
@@ -1213,6 +1224,24 @@ mod tests {
         );
         assert_eq!(wide.advance(&zero, 95u128.pow(10) - 1), Some(vec![94; 10]));
         assert_eq!(wide.advance(&zero, 95u128.pow(10)), None);
+    }
+
+    /// A box field may be a pinned axis — a bare `n`, shorthand for `n-n` (api.md §1.2).
+    /// It reverses into axis order like any other field.
+    #[test]
+    fn work_box_parses_a_pinned_axis() {
+        // api.md's own example: `42/0-50000/0-16777216/45-9999`, fastest axis last.
+        let b = WorkBox::parse_bounds("42/0-50000/0-16777216/45-9999").unwrap();
+        assert_eq!(
+            b.axes,
+            vec![(45, 9999), (0, 16_777_216), (0, 50_000), (42, 42)],
+        );
+        // Renders back to the same string, pinned axis and all.
+        assert_eq!(b.to_string(), "42/0-50000/0-16777216/45-9999");
+        // A pinned axis has radix 1, so it does not enlarge the space.
+        let pinned = WorkBox::parse_bounds("7/0-9").unwrap();
+        assert_eq!(pinned.axes, vec![(0, 9), (7, 7)]);
+        assert_eq!(pinned.cells().unwrap(), 10);
     }
 
     /// A bounds spec that is malformed, or breaks api.md §1.6, must be a handled error
