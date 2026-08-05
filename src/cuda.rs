@@ -393,14 +393,6 @@ impl WorkBox {
         u128::from(hi - lo) + 1
     }
 
-    /// Total cells in the box — the unit `Fragment.Steps` and the tile size count in.
-    pub fn cells(&self) -> Result<u128, String> {
-        (0..self.axes.len()).try_fold(1u128, |acc, i| {
-            acc.checked_mul(self.radix(i))
-                .ok_or_else(|| "box has more than 2^128 cells".to_string())
-        })
-    }
-
     /// Largest radix in the box — the term api.md §1.6 bounds a launch's `count`
     /// against, so the kernel's per-thread `(r_i - 1) + carry` cannot overflow.
     fn max_radix(&self) -> u128 {
@@ -827,10 +819,11 @@ pub fn run_job(
     // box axis.
     let d_start = DeviceBuf::alloc(8 * (2 + work.bounds.nfields()))?;
 
-    // Cells this fragment covers. A run can never be longer than the whole box, so an
-    // over-issued `Steps` is clamped rather than trusted — the odometer's carry stops it
-    // either way (api.md §1.5), but the progress denominator should be honest.
-    let total = u128::from(work.steps).min(work.bounds.cells()?);
+    // Cells this fragment covers. `Steps` is used directly, not clamped to the box
+    // size: the odometer's carry already stops a run that would walk off the end of the
+    // box (`advance` returns `None` below). The full box size is never needed — and for
+    // a brute space it can exceed 2^128 anyway (api.md §2.2), so it must not be computed.
+    let total = u128::from(work.steps);
     // api.md §1.6 bounds a launch: `count < u64::MAX` keeps the rejection sentinel
     // unambiguous, and `count <= u64::MAX - max(r_i)` keeps the kernel's per-thread
     // `(r_i - 1) + carry` from overflowing. No real tile comes near either; clamp
@@ -1097,6 +1090,16 @@ mod tests {
         assert_eq!(count_framed_records(&buf), 0);
     }
 
+    /// Product of a box's axis radices. The real code never computes this — the
+    /// odometer terminates a run without it (see `run_job`), and a brute box can exceed
+    /// 2^128 — but the boxes under test are small enough to check by eye.
+    fn box_cells(b: &WorkBox) -> u128 {
+        b.axes
+            .iter()
+            .map(|&(lo, hi)| u128::from(hi - lo) + 1)
+            .product()
+    }
+
     /// Build the descriptor words a cubin carries (api.md §5), then their raw bytes.
     fn desc_words(abi: u64, rec: u64, axes: &[(u64, u64)]) -> Vec<u8> {
         let mut w = vec![DESC_MAGIC, abi, rec, axes.len() as u64];
@@ -1186,13 +1189,13 @@ mod tests {
         assert_eq!(b.nfields(), 3);
         // Stored axis-0-first: pad (the rightmost wire field) leads.
         assert_eq!(b.axes, vec![(0, 4_999_999), (0, 254), (0, 86_399)]);
-        assert_eq!(b.cells().unwrap(), 5_000_000 * 255 * 86_400);
+        assert_eq!(box_cells(&b), 5_000_000 * 255 * 86_400);
         // And back out to the wire spelling for a log/`Bounds` comparison.
         assert_eq!(b.to_string(), "0-86399/0-254/0-4999999");
 
         // A single-axis space is the degenerate case — reversal is a no-op.
         let b = WorkBox::parse_bounds("0-999999").unwrap();
-        assert_eq!((b.nfields(), b.cells().unwrap()), (1, 1_000_000));
+        assert_eq!((b.nfields(), box_cells(&b)), (1, 1_000_000));
     }
 
     /// A start position is one bare value per wire field, most-significant-first like the
@@ -1225,7 +1228,7 @@ mod tests {
         // Wire "100-109/5-11": axis 0 = `5-11` (radix 7, spelled last), axis 1 = `100-109`
         // (radix 10). Both off zero so absolute values are visible.
         let b = WorkBox::parse_bounds("100-109/5-11").unwrap();
-        assert_eq!(b.cells().unwrap(), 70);
+        assert_eq!(box_cells(&b), 70);
         let origin = b.parse_position("100/5").unwrap();
         assert_eq!(origin, vec![5, 100]);
         assert_eq!(b.advance(&origin, 0), Some(vec![5, 100]));
@@ -1243,8 +1246,8 @@ mod tests {
         // A box far past 2^64 stays addressable — no flat offset is ever formed. Ten
         // axes of radix 95 is 95^10 = 2^66.4 cells, well beyond any single integer.
         let wide = WorkBox::parse_bounds(&["0-94"; 10].join("/")).unwrap();
-        assert_eq!(wide.cells().unwrap(), 95u128.pow(10));
-        assert!(wide.cells().unwrap() > u128::from(u64::MAX));
+        assert_eq!(box_cells(&wide), 95u128.pow(10));
+        assert!(box_cells(&wide) > u128::from(u64::MAX));
         let zero = vec![0u64; 10];
         assert_eq!(
             wide.advance(&zero, 95 * 95),
@@ -1252,6 +1255,24 @@ mod tests {
         );
         assert_eq!(wide.advance(&zero, 95u128.pow(10) - 1), Some(vec![94; 10]));
         assert_eq!(wide.advance(&zero, 95u128.pow(10)), None);
+    }
+
+    /// A brute box can exceed 2^128 cells (api.md §2.2). The run path must handle it: it
+    /// walks the odometer by up to `Steps` (a `u64`) and never multiplies the box out —
+    /// which would overflow. This is the exact scope that failed in the field with
+    /// "box has more than 2^128 cells": five axes, `36 × 2176782336^4 ≈ 2^129`.
+    #[test]
+    fn a_box_past_2_pow_128_still_runs() {
+        let spec = "0-35/0-2176782335/0-2176782335/0-2176782335/0-2176782335";
+        let b = WorkBox::parse_bounds(spec).unwrap();
+        assert_eq!(b.nfields(), 5);
+        // The failing fragment: Start "0/0/0/0/1310000" (+10000 steps). Advancing that
+        // far — or a full u64 of steps — is fine; only `advance` is ever used, and its
+        // digit-wise arithmetic never forms the box's size.
+        let start = b.parse_position("0/0/0/0/1310000").unwrap();
+        assert_eq!(start, vec![1_310_000, 0, 0, 0, 0]);
+        assert!(b.advance(&start, 10_000).is_some());
+        assert!(b.advance(&start, u128::from(u64::MAX)).is_some());
     }
 
     /// A box field may be a pinned axis — a bare `n`, shorthand for `n-n` (api.md §1.2).
@@ -1269,7 +1290,7 @@ mod tests {
         // A pinned axis has radix 1, so it does not enlarge the space.
         let pinned = WorkBox::parse_bounds("7/0-9").unwrap();
         assert_eq!(pinned.axes, vec![(0, 9), (7, 7)]);
-        assert_eq!(pinned.cells().unwrap(), 10);
+        assert_eq!(box_cells(&pinned), 10);
     }
 
     /// A bounds spec that is malformed, or breaks api.md §1.6, must be a handled error
