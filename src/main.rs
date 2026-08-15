@@ -44,7 +44,7 @@ use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -52,7 +52,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use klbfw::{Config, RestContext};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use uuid::Uuid;
 
 /// Run as a worker: claim Decrypt/Job fragments, run the kernel, submit results.
@@ -613,6 +613,9 @@ struct FinishedJob {
     output: Vec<u8>,
     /// Seconds the GPU spent on this fragment.
     run_secs: f64,
+    /// Cells this fragment covered (`Work::steps`). With `run_secs`, gives the
+    /// worker's throughput for the next pullOne's `wps` (see [`LastWps`]).
+    work_steps: u64,
     /// Seconds spent downloading this job's blobs (carried from [`ReadyJob`]).
     download_secs: f64,
     /// Arch tag of the cubin that ran (`X*10+Y`), reported as `sm<NN>` at submit.
@@ -628,6 +631,11 @@ struct FinishedJob {
 /// stored key here and submit with it — otherwise the in-flight copy's key is stale and
 /// the submit is rejected.
 type InFlight = Arc<Mutex<HashMap<String, String>>>;
+
+/// The most recently finished job's throughput in cells per second (`steps / run_secs`),
+/// shared from the runners to the prefetchers so the next pullOne can report this
+/// worker's speed to the platform's fragment sizer. `None` until the first job completes.
+type LastWps = Arc<Mutex<Option<f64>>>;
 
 /// Per-content-hash download locks, shared across every GPU's prefetch thread.
 /// Two GPUs claiming fragments of the same job fetch the same blobs; without
@@ -830,13 +838,28 @@ fn claim_and_fetch(
     worker_id: &str,
     ctx: &RestContext,
     inflight: &InFlight,
+    wps: Option<f64>,
 ) -> Result<Option<ReadyJob>> {
+    // pullOne carries this worker's identity and its last measured speed, so the
+    // platform can attribute and size work. `worker` is the persistent id; `hostname`
+    // and `instance_id` group workers by machine (§host_ident); `wps` is the previous
+    // job's throughput in cells per second, null on the first request.
+    let ident = host_ident();
+    let mut body = serde_json::Map::new();
+    body.insert("worker".into(), Value::String(worker_id.to_string()));
+    if let Some(h) = &ident.hostname {
+        body.insert("hostname".into(), Value::String(h.clone()));
+    }
+    if let Some(i) = &ident.instance_id {
+        body.insert("instance_id".into(), Value::String(i.clone()));
+    }
+    body.insert(
+        "wps".into(),
+        wps.and_then(serde_json::Number::from_f64)
+            .map_or(Value::Null, Value::Number),
+    );
     let resp = ctx
-        .do_request(
-            "Decrypt/Job:pullOne",
-            "POST",
-            json!({ "worker": worker_id }),
-        )
+        .do_request("Decrypt/Job:pullOne", "POST", Value::Object(body))
         .map_err(|e| anyhow!("Decrypt/Job:pullOne: {e}"))?;
     // pullOne returns null data when there are no open jobs with fragments to issue.
     let Some(data) = resp.raw().filter(|v| !v.is_null()) else {
@@ -1037,6 +1060,7 @@ fn run_on_gpu(ordinal: i32, job: ReadyJob, status: &Status) -> Result<FinishedJo
         records,
         output,
         run_secs,
+        work_steps: work.steps,
         download_secs: job.download_secs,
         cubin_arch,
         gpu_idx: ordinal,
@@ -1109,13 +1133,17 @@ fn prefetch_loop(
     worker_id: String,
     ctx: RestContext,
     inflight: InFlight,
+    last_wps: LastWps,
     ready: SyncSender<ReadyJob>,
     status: Status,
 ) {
     loop {
         // Don't claim new work while paused.
         status.wait_while_paused();
-        match claim_and_fetch(ordinal, &args, &downloads, &worker_id, &ctx, &inflight) {
+        // Report the worker's most recent speed so the platform can size the next
+        // fragment; `None` until the first job completes.
+        let wps = *last_wps.lock().unwrap();
+        match claim_and_fetch(ordinal, &args, &downloads, &worker_id, &ctx, &inflight, wps) {
             Ok(Some(job)) => {
                 status.set_note(""); // got work; clear any idle note
                 if ready.send(job).is_err() {
@@ -1141,6 +1169,7 @@ fn prefetch_loop(
 
 /// GPU stage: the serialized step. One per `--jobs`; each takes a ready job, runs it,
 /// and hands the result to the upload stage.
+#[allow(clippy::too_many_arguments)]
 fn run_loop(
     ordinal: i32,
     args: Arc<RunArgs>,
@@ -1148,6 +1177,7 @@ fn run_loop(
     inflight: InFlight,
     done: SyncSender<FinishedJob>,
     pending: Arc<AtomicUsize>,
+    last_wps: LastWps,
     status: Status,
 ) {
     loop {
@@ -1162,6 +1192,13 @@ fn run_loop(
         let _running = status.run_guard();
         match run_on_gpu(ordinal, job, &status) {
             Ok(finished) => {
+                // Record this run's throughput (cells per second) so the next pullOne
+                // reports the worker's speed. Skip a zero-duration run (can't happen for
+                // a real fragment, but never divide by zero).
+                if finished.run_secs > 0.0 {
+                    *last_wps.lock().unwrap() =
+                        Some(finished.work_steps as f64 / finished.run_secs);
+                }
                 // Hand the result to the shared upload pool. `pending` counts results
                 // produced but not yet uploaded; a full queue means every upload slot
                 // is busy, so this GPU is about to idle waiting to hand off — log it,
@@ -1374,6 +1411,52 @@ fn load_or_create_worker_id(workdir: &Path) -> Result<String> {
     Ok(id)
 }
 
+/// Stable identity of the host this worker runs on, sent alongside `worker=` on every
+/// pullOne so the platform can group workers by machine. Both fields are best-effort and
+/// computed once (a hostname lookup is a syscall; pullOne is called often).
+struct HostIdent {
+    /// The machine's hostname, or `None` if it can't be determined.
+    hostname: Option<String>,
+    /// The `INSTANCE_ID` environment variable, if set and non-empty — cloud/orchestrator
+    /// instance identity, which the hostname alone doesn't capture.
+    instance_id: Option<String>,
+}
+
+fn host_ident() -> &'static HostIdent {
+    static IDENT: OnceLock<HostIdent> = OnceLock::new();
+    IDENT.get_or_init(|| HostIdent {
+        hostname: hostname(),
+        instance_id: std::env::var("INSTANCE_ID").ok().filter(|s| !s.is_empty()),
+    })
+}
+
+/// The machine's hostname, best-effort. On unix this asks the kernel via
+/// `gethostname(2)` — what the running system actually calls itself, unlike `$HOSTNAME`
+/// which a daemon's environment usually doesn't carry — falling back to that env var
+/// only if the syscall fails. Elsewhere it reads the environment.
+#[cfg(unix)]
+fn hostname() -> Option<String> {
+    unsafe extern "C" {
+        fn gethostname(name: *mut std::ffi::c_char, len: usize) -> i32;
+    }
+    let mut buf = [0u8; 256];
+    // SAFETY: `gethostname` writes at most `buf.len()` bytes and NUL-terminates when the
+    // name fits; we pass the true length and read only up to the first NUL.
+    if unsafe { gethostname(buf.as_mut_ptr() as *mut std::ffi::c_char, buf.len()) } != 0 {
+        return std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty());
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]).into_owned();
+    (!name.is_empty()).then_some(name)
+}
+#[cfg(not(unix))]
+fn hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 fn run_worker(args: RunArgs, status: Status) -> Result<()> {
     let workdir = args.workdir();
     std::fs::create_dir_all(&workdir)
@@ -1391,11 +1474,14 @@ fn run_worker(args: RunArgs, status: Status) -> Result<()> {
 
     let inflight: InFlight = Arc::new(Mutex::new(HashMap::new()));
     let downloads: Downloads = Arc::new(Mutex::new(HashMap::new()));
+    // Worker speed from the last finished job, fed back into the next pullOne.
+    let last_wps: LastWps = Arc::new(Mutex::new(None));
 
     if args.once {
         // Single fragment on the first selected GPU.
         let ord = gpus[0];
-        return match claim_and_fetch(ord, &args, &downloads, &worker_id, &ctx, &inflight)? {
+        // First (and only) request: no prior job, so no wps to report.
+        return match claim_and_fetch(ord, &args, &downloads, &worker_id, &ctx, &inflight, None)? {
             Some(job) => {
                 let key = inflight.lock().unwrap().get(&job.frag_id).cloned();
                 let key = key.ok_or_else(|| anyhow!("fragment lost its response key"))?;
@@ -1449,31 +1535,35 @@ fn run_worker(args: RunArgs, status: Status) -> Result<()> {
         let ready_rx = Arc::new(Mutex::new(ready_rx));
 
         {
-            let (args, downloads, ctx, inflight, status, worker_id) = (
+            let (args, downloads, ctx, inflight, last_wps, status, worker_id) = (
                 args.clone(),
                 downloads.clone(),
                 ctx.clone(),
                 inflight.clone(),
+                last_wps.clone(),
                 status.clone(),
                 worker_id.clone(),
             );
             thread::spawn(move || {
                 prefetch_loop(
-                    ord, args, downloads, worker_id, ctx, inflight, ready_tx, status,
+                    ord, args, downloads, worker_id, ctx, inflight, last_wps, ready_tx, status,
                 )
             });
         }
         for _ in 0..jobs {
-            let (args, ready_rx, inflight, done_tx, pending) = (
+            let (args, ready_rx, inflight, done_tx, pending, last_wps) = (
                 args.clone(),
                 ready_rx.clone(),
                 inflight.clone(),
                 done_tx.clone(),
                 pending.clone(),
+                last_wps.clone(),
             );
             let status = status.clone();
             runners.push(thread::spawn(move || {
-                run_loop(ord, args, ready_rx, inflight, done_tx, pending, status)
+                run_loop(
+                    ord, args, ready_rx, inflight, done_tx, pending, last_wps, status,
+                )
             }));
         }
     }
@@ -1692,6 +1782,21 @@ mod tests {
         assert_eq!(load_or_create_worker_id(&dir).unwrap(), "my-pinned-id");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Exercises the `gethostname` FFI: it must not panic or corrupt memory, and any
+    /// value it returns is non-empty — the caller relies on that to decide whether to
+    /// send a `hostname` at all. `host_ident` must likewise be callable and stable.
+    #[test]
+    #[cfg(unix)]
+    fn hostname_ffi_is_safe() {
+        if let Some(h) = hostname() {
+            assert!(!h.is_empty(), "hostname is Some only when non-empty");
+        }
+        // Cached identity returns the same pointer twice (OnceLock), and its hostname
+        // agrees with a fresh lookup.
+        assert!(std::ptr::eq(host_ident(), host_ident()));
+        assert_eq!(host_ident().hostname, hostname());
     }
 
     #[test]
